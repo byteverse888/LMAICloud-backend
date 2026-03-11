@@ -1,0 +1,45 @@
+# ubuntu-24.04-pod.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ubuntu-24-04
+  labels:
+    app: test
+spec:
+  # 如果是 KubeEdge 边缘节点，取消注释下面两行
+  # nodeSelector:
+  #   kubernetes.io/hostname: edge-node1-jincm
+  
+  # KubeEdge 边缘节点需要容忍污点（如果是标准 K8s 可删除）
+  tolerations:
+  - key: node-role.kubernetes.io/edge
+    operator: Exists
+    effect: NoSchedule
+  
+  containers:
+  - name: ubuntu
+    image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/ubuntu:24.04
+    command: ["sleep", "3600"]  # 保持运行 1 小时
+    # 或使用 tail 保持运行（更轻量）
+    # command: ["tail", "-f", "/dev/null"]
+    
+    resources:
+      limits:
+        memory: "512Mi"
+        cpu: "500m"
+      requests:
+        memory: "128Mi"
+        cpu: "100m"
+    
+    # 如果需要特权模式（调试用）
+    # securityContext:
+    #   privileged: true
+    
+    # 挂载主机目录（可选）
+    # volumeMounts:
+    # - name: host-tmp
+    #   mountPath: /host-tmp
+  # volumes:
+  # - name: host-tmp
+  #   hostPath:
+  #     path: /tmp
