@@ -121,6 +121,7 @@ class InstanceStatus(str, enum.Enum):
     ERROR = "error"
     EXPIRED = "expired"
     RELEASING = "releasing"
+    RELEASED = "released"
 
 
 class BillingType(str, enum.Enum):

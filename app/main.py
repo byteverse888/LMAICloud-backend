@@ -10,6 +10,7 @@ from app.api.v1 import auth, users, instances, storage, images, billing, market
 from app.api.v1 import websocket as ws
 from app.api.v1 import tickets, system
 from app.api.v1.admin import clusters, nodes, admin_users, admin_orders, reports, admin_settings, admin_images, admin_tickets
+from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admin_storage
 
 # 初始化日志系统
 logger = setup_logging()
@@ -95,6 +96,10 @@ LMAICloud 提供企业级GPU算力租用服务，支持以下功能：
         {"name": "管理-设置", "description": "管理后台-系统设置"},
         {"name": "管理-应用镜像", "description": "管理后台-应用镜像管理"},
         {"name": "管理-工单", "description": "管理后台-工单管理"},
+        {"name": "管理-服务", "description": "管理后台-K8s Service管理"},
+        {"name": "管理-部署", "description": "管理后台-K8s Deployment管理"},
+        {"name": "管理-容器", "description": "管理后台-K8s Pod管理"},
+        {"name": "管理-存储", "description": "管理后台-K8s 存储管理"},
         {"name": "工单", "description": "用户工单提交与查看"},
     ],
 )
@@ -128,6 +133,10 @@ app.include_router(reports.router, prefix="/api/v1/admin/reports", tags=["管理
 app.include_router(admin_settings.router, prefix="/api/v1/admin/settings", tags=["管理-设置"])
 app.include_router(admin_images.router, prefix="/api/v1/admin/images", tags=["管理-应用镜像"])
 app.include_router(admin_tickets.router, prefix="/api/v1/admin/tickets", tags=["管理-工单"])
+app.include_router(admin_services.router, prefix="/api/v1/admin/services", tags=["管理-服务"])
+app.include_router(admin_deployments.router, prefix="/api/v1/admin/deployments", tags=["管理-部署"])
+app.include_router(admin_pods.router, prefix="/api/v1/admin/pods", tags=["管理-容器"])
+app.include_router(admin_storage.router, prefix="/api/v1/admin/storage", tags=["管理-存储"])
 
 # WebSocket routes
 app.include_router(ws.router, tags=["WebSocket"])

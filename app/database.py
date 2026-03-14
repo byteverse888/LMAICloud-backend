@@ -64,9 +64,40 @@ async def init_db():
     await ensure_database_exists()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    
+
+    # 自动迁移: 给 PostgreSQL 枚举类型追加缺失的值（如 released）
+    await migrate_enum_values()
+
     # 创建默认用户
     await create_default_users()
+
+
+async def migrate_enum_values():
+    """给已有的 PostgreSQL 枚举类型追加新增值（ALTER TYPE ... ADD VALUE 需在事务外执行）"""
+    import logging
+    logger = logging.getLogger("lmaicloud.database")
+
+    # 需要追加的枚举值: (pg_type_name, new_value)
+    # 注意: SQLAlchemy Enum(PythonEnum) 在 PG 中使用枚举**名称**（大写）作为存储值
+    additions = [
+        ("instancestatus", "RELEASED"),
+    ]
+
+    try:
+        raw_url = settings.database_url.replace("postgresql+asyncpg://", "")
+        conn = await asyncpg.connect(f"postgresql://{raw_url}")
+        for type_name, new_value in additions:
+            # 检查值是否已存在
+            exists = await conn.fetchval(
+                "SELECT 1 FROM pg_enum WHERE enumtypid = $1::regtype AND enumlabel = $2",
+                type_name, new_value,
+            )
+            if not exists:
+                await conn.execute(f"ALTER TYPE {type_name} ADD VALUE '{new_value}'")
+                logger.info(f"PostgreSQL 枚举 {type_name} 已追加值 '{new_value}'")
+        await conn.close()
+    except Exception as e:
+        logger.warning(f"枚举迁移跳过: {e}")
 
 
 async def create_default_users():

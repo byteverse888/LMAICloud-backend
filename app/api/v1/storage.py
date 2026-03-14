@@ -18,18 +18,27 @@ from app.database import get_db
 from app.models import User, Storage, Cluster
 from app.utils.auth import get_current_user
 from app.config import settings
+from app.logging_config import get_logger
 
 router = APIRouter()
+logger = get_logger("lmaicloud.storage")
 
-# 存储根目录
-STORAGE_ROOT = os.environ.get("STORAGE_ROOT", "/data/lmaicloud/storage")
+# 存储根目录（从 settings 读取，.env 中 STORAGE_ROOT 配置）
+STORAGE_ROOT = settings.storage_root
 
 
 def get_user_storage_path(user_id: str, region: str) -> Path:
-    """获取用户存储路径"""
-    path = Path(STORAGE_ROOT) / region / user_id
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    """获取用户存储路径（自动创建目录）"""
+    try:
+        path = Path(STORAGE_ROOT) / region / user_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    except Exception as e:
+        logger.warning(f"创建存储目录失败: {e}")
+        # 回退到临时路径，保证不抛异常
+        fallback = Path("/tmp/lmaicloud_storage") / region / user_id
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
 
 
 def format_size(size_bytes: int) -> str:
@@ -48,29 +57,38 @@ async def list_storage(
     db: AsyncSession = Depends(get_db)
 ):
     """获取存储列表(顶层目录)"""
-    result = await db.execute(
-        select(Storage).where(
-            Storage.user_id == current_user.id
+    try:
+        result = await db.execute(
+            select(Storage).where(
+                Storage.user_id == current_user.id
+            )
         )
-    )
-    storages = result.scalars().all()
-    
-    return {
-        "list": [
-            {
-                "id": str(s.id),
-                "name": s.name,
-                "size": s.size,
-                "path": s.path,
-                "is_directory": s.is_directory,
-                "created_at": s.created_at.isoformat() if s.created_at else None,
-            }
-            for s in storages
-        ],
-        "total": len(storages),
-        "page": 1,
-        "size": 20
-    }
+        storages = result.scalars().all()
+
+        return {
+            "list": [
+                {
+                    "id": str(s.id),
+                    "name": s.name,
+                    "size": s.size,
+                    "path": s.path,
+                    "is_directory": s.is_directory,
+                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                }
+                for s in storages
+            ],
+            "total": len(storages),
+            "page": 1,
+            "size": 20
+        }
+    except Exception as e:
+        logger.error(f"list_storage 异常: {e}")
+        return {
+            "list": [],
+            "total": 0,
+            "page": 1,
+            "size": 20
+        }
 
 
 @router.get("/files")
@@ -80,36 +98,44 @@ async def list_files(
     current_user: User = Depends(get_current_user)
 ):
     """列出目录下的文件"""
-    user_path = get_user_storage_path(str(current_user.id), region)
-    target_path = user_path / path.lstrip("/")
-    
-    if not target_path.exists():
-        target_path.mkdir(parents=True, exist_ok=True)
-    
-    files = []
     try:
-        for item in target_path.iterdir():
-            stat = item.stat()
-            files.append({
-                "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(item))),
-                "name": item.name,
-                "path": str(item.relative_to(user_path)),
-                "size": stat.st_size if item.is_file() else 0,
-                "size_formatted": format_size(stat.st_size) if item.is_file() else "-",
-                "is_directory": item.is_dir(),
-                "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-            })
+        user_path = get_user_storage_path(str(current_user.id), region)
+        target_path = user_path / path.lstrip("/")
+
+        if not target_path.exists():
+            target_path.mkdir(parents=True, exist_ok=True)
+
+        files = []
+        try:
+            for item in target_path.iterdir():
+                stat = item.stat()
+                files.append({
+                    "id": str(uuid.uuid5(uuid.NAMESPACE_URL, str(item))),
+                    "name": item.name,
+                    "path": str(item.relative_to(user_path)),
+                    "size": stat.st_size if item.is_file() else 0,
+                    "size_formatted": format_size(stat.st_size) if item.is_file() else "-",
+                    "is_directory": item.is_dir(),
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+        except Exception as e:
+            logger.warning(f"遍历目录失败 {target_path}: {e}")
+
+        # 按目录优先、名称排序
+        files.sort(key=lambda x: (not x["is_directory"], x["name"].lower()))
+
+        return {
+            "files": files,
+            "total": len(files),
+            "current_path": path
+        }
     except Exception as e:
-        pass
-    
-    # 按目录优先、名称排序
-    files.sort(key=lambda x: (not x["is_directory"], x["name"].lower()))
-    
-    return {
-        "files": files,
-        "total": len(files),
-        "current_path": path
-    }
+        logger.error(f"list_files 异常: {e}")
+        return {
+            "files": [],
+            "total": 0,
+            "current_path": path
+        }
 
 
 @router.get("/quota")
@@ -118,23 +144,22 @@ async def get_storage_quota(
     current_user: User = Depends(get_current_user)
 ):
     """获取存储配额"""
-    user_path = get_user_storage_path(str(current_user.id), region)
-    
-    # 计算已使用空间
+    # 默认配额
+    free_quota = 20 * 1024 * 1024 * 1024  # 20GB免费
+    default_total = 200 * 1024 * 1024 * 1024  # 200GB总配额
+
     total_size = 0
     try:
+        user_path = get_user_storage_path(str(current_user.id), region)
         for item in user_path.rglob("*"):
             if item.is_file():
                 total_size += item.stat().st_size
-    except Exception:
-        pass
-    
-    # 默认配额
-    free_quota = 20 * 1024 * 1024 * 1024  # 20GB免费
-    
+    except Exception as e:
+        logger.warning(f"计算存储用量失败: {e}")
+
     return {
         "used": total_size,
-        "total": 200 * 1024 * 1024 * 1024,  # 200GB总配额
+        "total": default_total,
         "free": free_quota,
         "paid": 0
     }

@@ -67,6 +67,8 @@ class PodManager:
         同时对 edge 节点增加 toleration 以适配 KubeEdge 边缘场景。
         """
         short_id = instance_id[:8]
+        # 限制实例数量，防止创建过多副本导致 OOM 循环
+        instance_count = max(1, min(instance_count, 5))
         labels = {
             "app": "gpu-instance",
             "instance-id": instance_id,
@@ -259,6 +261,10 @@ class PodManager:
                 "template": {
                     "metadata": {
                         "labels": labels,
+                        "annotations": {
+                            "lmaicloud/instance-name": instance_name,
+                            "lmaicloud/node-type": node_type,
+                        },
                     },
                     "spec": pod_spec,
                 },
@@ -320,7 +326,7 @@ class PodManager:
 
     # ========== 实例生命周期 ==========
 
-    async def create_instance(
+    def create_instance(
         self,
         instance_id: str,
         instance_name: str,
@@ -414,21 +420,47 @@ class PodManager:
             "internal_ip": "",
         }
 
-    async def start_instance(self, instance_id: str) -> bool:
+    def start_instance(self, instance_id: str) -> bool:
         """启动实例 - 将 Deployment replicas 设为 1"""
         dep_name = f"inst-{instance_id[:8]}"
         return self.k8s.scale_deployment(dep_name, self.NAMESPACE, 1)
 
-    async def stop_instance(self, instance_id: str) -> bool:
+    def stop_instance(self, instance_id: str) -> bool:
         """停止实例 - 将 Deployment replicas 设为 0 (保留配置)"""
         dep_name = f"inst-{instance_id[:8]}"
         return self.k8s.scale_deployment(dep_name, self.NAMESPACE, 0)
 
-    async def release_instance(self, instance_id: str) -> bool:
-        """释放实例 - 删除 Deployment + Service"""
+    def release_instance(self, instance_id: str) -> bool:
+        """删除实例 - 删除 Deployment + Service（Pod 随 Deployment 级联删除）"""
         dep_name = f"inst-{instance_id[:8]}"
         svc_name = f"svc-{instance_id[:8]}"
         self.k8s.delete_deployment(dep_name, self.NAMESPACE)
+        self.k8s.delete_service(svc_name, self.NAMESPACE)
+        return True
+
+    def force_cleanup_instance(self, instance_id: str) -> bool:
+        """
+        强制清理实例所有 K8s 资源（不管当前状态）
+
+        1. 删除 Deployment（级联删除正常 Pod）
+        2. 强制删除所有关联 Pod（grace_period=0，处理 Terminating 卡住的情况）
+        3. 删除 Service
+        """
+        dep_name = f"inst-{instance_id[:8]}"
+        svc_name = f"svc-{instance_id[:8]}"
+        # 1. 删除 Deployment
+        self.k8s.delete_deployment(dep_name, self.NAMESPACE)
+        # 2. 强制删除所有关联 Pod（包括孤儿 Pod / Terminating Pod）
+        try:
+            pods = self.k8s.list_pods(
+                self.NAMESPACE,
+                label_selector=f"instance-id={instance_id}",
+            )
+            for pod in (pods or []):
+                self.k8s.delete_pod(pod["name"], self.NAMESPACE, force=True)
+        except Exception:
+            pass  # 忽略 Pod 删除异常
+        # 3. 删除 Service
         self.k8s.delete_service(svc_name, self.NAMESPACE)
         return True
 
@@ -444,15 +476,19 @@ class PodManager:
 
     def get_instance_logs(self, instance_id: str, tail_lines: int = 100) -> Optional[str]:
         """获取实例日志 - 查找 Deployment 关联的 Pod"""
-        pods = self.k8s.list_pods(
-            self.NAMESPACE,
-            label_selector=f"instance-id={instance_id}"
-        )
-        if pods:
-            return self.k8s.get_pod_logs(pods[0]["name"], self.NAMESPACE, tail_lines)
-        # fallback
-        pod_name = f"instance-{instance_id[:8]}"
-        return self.k8s.get_pod_logs(pod_name, self.NAMESPACE, tail_lines)
+        try:
+            pods = self.k8s.list_pods(
+                self.NAMESPACE,
+                label_selector=f"instance-id={instance_id}"
+            )
+            if pods:
+                return self.k8s.get_pod_logs(pods[0]["name"], self.NAMESPACE, tail_lines)
+            # fallback
+            pod_name = f"instance-{instance_id[:8]}"
+            return self.k8s.get_pod_logs(pod_name, self.NAMESPACE, tail_lines)
+        except Exception as e:
+            print(f"[PodManager] Error getting instance logs for {instance_id}: {e}")
+            return None
 
     def get_deployment_yaml(self, instance_id: str) -> Optional[str]:
         """获取保存的 Deployment YAML 文件内容"""

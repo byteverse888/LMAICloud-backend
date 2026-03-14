@@ -24,6 +24,8 @@ arq==0.26.1
 
 # Kubernetes
 kubernetes==31.0.0
+websocket-client>=1.6.1
+urllib3>=1.26.0,<2.1
 
 # Utils
 python-dateutil==2.9.0

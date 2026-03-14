@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     # JWT
     jwt_secret_key: str = "your-super-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 30
-    jwt_refresh_token_expire_days: int = 7
+    jwt_access_token_expire_minutes: int = 15
+    jwt_refresh_token_expire_minutes: int = 10
     
     # Redis
     redis_url: str = "redis://localhost:6379"
@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     k8s_cluster_name: str = "default-cluster"
     k8s_cluster_region: str = "cn-beijing"
     kubeconfig_path: str = ""  # 留空则使用默认路径 ~/.kube/config
+    
+    # 存储
+    storage_root: str = "/opt/data/"
     
     # GPU Node 默认配置
     default_gpu_hourly_price: float = 5.0  # 元/小时

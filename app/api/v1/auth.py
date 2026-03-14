@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from app.database import get_db
 from app.models import User, SystemSetting
 from app.schemas import UserCreate, UserLogin, UserResponse, LoginResponse
-from app.utils.auth import get_password_hash, verify_password, create_access_token, get_current_user
+from app.utils.auth import get_password_hash, verify_password, create_access_token, create_refresh_token, decode_token, get_current_user
 from app.logging_config import get_logger
 from app.config import settings
 from app.services.email_service import send_activation_email, get_email_config
@@ -46,6 +46,11 @@ class ActivateEmailRequest(BaseModel):
 class ResendActivationRequest(BaseModel):
     """重新发送激活邮件请求"""
     email: EmailStr
+
+
+class RefreshTokenRequest(BaseModel):
+    """刷新Token请求"""
+    refresh_token: str
 
 
 def generate_code(length: int = 6) -> str:
@@ -376,9 +381,10 @@ async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
         )
     
     access_token = create_access_token(data={"sub": str(user.id)})
+    refresh_token = create_refresh_token(data={"sub": str(user.id)})
     
     logger.info(f"用户登录成功: {user.email}, ID: {user.id}")
-    return LoginResponse(user=user, token=access_token)
+    return LoginResponse(user=user, token=access_token, refresh_token=refresh_token)
 
 
 @router.get("/me", response_model=UserResponse)
@@ -389,6 +395,41 @@ async def get_me(current_user: User = Depends(get_current_user)):
 @router.post("/logout")
 async def logout():
     return {"message": "Successfully logged out"}
+
+
+@router.post("/refresh")
+async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends(get_db)):
+    """使用 refresh_token 换取新的 access_token + refresh_token"""
+    payload = decode_token(request.refresh_token)
+    if not payload or payload.get("type") != "refresh":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token"
+        )
+    
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid refresh token"
+        )
+    
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found"
+        )
+    
+    new_access_token = create_access_token(data={"sub": str(user.id)})
+    new_refresh_token = create_refresh_token(data={"sub": str(user.id)})
+    
+    logger.info(f"Token刷新成功: {user.email}")
+    return {
+        "token": new_access_token,
+        "refresh_token": new_refresh_token
+    }
 
 
 @router.post("/forgot-password")

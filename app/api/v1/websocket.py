@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import asyncio
 import json
+import uuid
 import threading
 from typing import Optional
 
@@ -131,14 +132,14 @@ class TerminalManager:
             except Exception as e:
                 logger.error(f"Exec发送失败: {e}")
 
-    def read_from_exec(self, instance_id: str) -> Optional[str]:
-        """从 exec stream 读取数据"""
+    def read_from_exec(self, instance_id: str, timeout: float = 1) -> Optional[str]:
+        """从 exec stream 读取数据（阻塞式，需在线程中调用）"""
         if instance_id not in self.exec_streams:
             return None
         try:
             resp = self.exec_streams[instance_id]
             if resp.is_open():
-                resp.update(timeout=0)
+                resp.update(timeout=timeout)
                 output = ""
                 if resp.peek_stdout():
                     output += resp.read_stdout()
@@ -146,7 +147,8 @@ class TerminalManager:
                     output += resp.read_stderr()
                 return output if output else None
             return None
-        except Exception:
+        except Exception as e:
+            logger.error(f"read_from_exec 异常 - 实例: {instance_id}, 错误: {e}")
             return None
 
     def resize_exec(self, instance_id: str, cols: int, rows: int):
@@ -226,78 +228,61 @@ async def websocket_terminal(
         if instance.status not in ("running", "error"):
             await websocket.close(code=4000, reason=f"Instance not available: {instance.status}")
             return
-        
-        ssh_host = instance.ssh_host
-        ssh_port = instance.ssh_port
-        ssh_password = instance.ssh_password
     
-    await terminal_manager.connect(websocket, instance_id)
-    
-    # 判断连接模式: ssh / exec
-    use_exec = False
+    # 为本次连接生成唯一 session_id，避免同一实例多连接互相覆盖
+    session_id = f"{instance_id}:{uuid.uuid4().hex[:8]}"
+    await terminal_manager.connect(websocket, session_id)
     
     try:
-        # 优先尝试 SSH
-        ssh_ok = False
-        if SSH_AVAILABLE and ssh_host and ssh_port and ssh_password:
-            await websocket.send_json({
-                "type": "info",
-                "data": f"正在通过SSH连接到 {ssh_host}:{ssh_port}..."
-            })
-            ssh_ok = terminal_manager.create_ssh_connection(
-                host=ssh_host, port=ssh_port,
-                password=ssh_password, instance_id=instance_id
-            )
-
-        # SSH 不可用，降级到 kubectl exec
-        if not ssh_ok:
-            await websocket.send_json({
-                "type": "info",
-                "data": "SSH不可用，切换到 kubectl exec 模式..."
-            })
-            k8s = get_k8s_client()
-            namespace = "lmaicloud"
+        # 直接使用 kubectl exec 模式
+        k8s = get_k8s_client()
+        namespace = "lmaicloud"
+        try:
             pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
-            if not pods:
-                await websocket.send_json({
-                    "type": "error",
-                    "data": "未找到关联的 Pod"
-                })
-                return
-            pod_name = pods[0]["name"]
+        except Exception as e:
+            logger.error(f"K8s list_pods 异常: {e}")
+            pods = []
+        if not pods:
+            await websocket.send_json({
+                "type": "error",
+                "data": "未找到关联的 Pod，K8s 连接可能异常"
+            })
+            return
+        pod_name = pods[0]["name"]
+        try:
             exec_ok = terminal_manager.create_exec_connection(
-                pod_name=pod_name, namespace=namespace, instance_id=instance_id
+                pod_name=pod_name, namespace=namespace, instance_id=session_id
             )
-            if not exec_ok:
-                await websocket.send_json({
-                    "type": "error",
-                    "data": "终端连接失败（SSH 和 kubectl exec 均失败）"
-                })
-                return
-            use_exec = True
+        except Exception as e:
+            logger.error(f"create_exec_connection 异常: {e}")
+            exec_ok = False
+        if not exec_ok:
+            await websocket.send_json({
+                "type": "error",
+                "data": "终端连接失败"
+            })
+            return
 
         # 发送连接成功消息
-        mode_label = "kubectl exec" if use_exec else "SSH"
         await websocket.send_json({
             "type": "connected",
-            "data": f"终端已连接（{mode_label}）- 实例 {instance_id[:8]}"
+            "data": f"终端已连接 - 实例 {instance_id[:8]}"
         })
         
         # 启动输出读取任务
         async def read_output():
             while True:
                 try:
-                    if use_exec:
-                        output = terminal_manager.read_from_exec(instance_id)
-                    else:
-                        output = terminal_manager.read_from_ssh(instance_id)
+                    output = await asyncio.to_thread(
+                        terminal_manager.read_from_exec, session_id
+                    )
                     if output:
                         await websocket.send_json({
                             "type": "output",
                             "data": output
                         })
-                    await asyncio.sleep(0.05)
-                except Exception:
+                except Exception as e:
+                    logger.error(f"read_output 异常 - 实例: {instance_id}, 错误: {e}")
                     break
         
         read_task = asyncio.create_task(read_output())
@@ -309,19 +294,16 @@ async def websocket_terminal(
                 message = json.loads(data)
                 
                 if message.get("type") == "input":
-                    cmd_input = message.get("data", "")
-                    if use_exec:
-                        terminal_manager.send_to_exec(instance_id, cmd_input)
-                    else:
-                        terminal_manager.send_to_ssh(instance_id, cmd_input)
+                    await asyncio.to_thread(
+                        terminal_manager.send_to_exec, session_id, message.get("data", "")
+                    )
                     
                 elif message.get("type") == "resize":
-                    cols = message.get("cols", 120)
-                    rows = message.get("rows", 40)
-                    if use_exec:
-                        terminal_manager.resize_exec(instance_id, cols, rows)
-                    else:
-                        terminal_manager.resize_ssh(instance_id, cols, rows)
+                    terminal_manager.resize_exec(
+                        session_id,
+                        message.get("cols", 120),
+                        message.get("rows", 40)
+                    )
                     
                 elif message.get("type") == "ping":
                     await websocket.send_json({"type": "pong"})
@@ -339,7 +321,7 @@ async def websocket_terminal(
         except:
             pass
     finally:
-        terminal_manager.disconnect(instance_id)
+        terminal_manager.disconnect(session_id)
 
 
 @router.websocket("/ws/logs/{instance_id}")
@@ -387,7 +369,11 @@ async def websocket_logs(
         namespace = "lmaicloud"
         
         # 通过 label selector 查找 Deployment 关联的 Pod（Pod 名由 ReplicaSet 随机后缀生成）
-        pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
+        try:
+            pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
+        except Exception as e:
+            logger.error(f"日志流 list_pods 异常: {e}")
+            pods = []
         pod_name = pods[0]["name"] if pods else None
         
         # 发送连接成功消息
@@ -404,7 +390,10 @@ async def websocket_logs(
             # 仍保持连接，循环等待 Pod 出现
         
         # 获取初始日志
-        initial_logs = k8s.get_pod_logs(pod_name, namespace, tail_lines=tail) if pod_name else None
+        try:
+            initial_logs = k8s.get_pod_logs(pod_name, namespace, tail_lines=tail) if pod_name else None
+        except Exception:
+            initial_logs = None
         if initial_logs:
             await websocket.send_json({
                 "type": "log",
@@ -434,10 +423,16 @@ async def websocket_logs(
                 
                 # 获取新日志（动态刷新 pod_name，Pod 可能重建）
                 if not pod_name:
-                    pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
-                    pod_name = pods[0]["name"] if pods else None
+                    try:
+                        pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
+                        pod_name = pods[0]["name"] if pods else None
+                    except Exception:
+                        pass
                 
-                logs = k8s.get_pod_logs(pod_name, namespace, tail_lines=tail) if pod_name else None
+                try:
+                    logs = k8s.get_pod_logs(pod_name, namespace, tail_lines=tail) if pod_name else None
+                except Exception:
+                    logs = None
                 if logs:
                     current_hash = hash(logs)
                     if current_hash != last_log_hash:

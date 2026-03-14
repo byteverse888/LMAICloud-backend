@@ -47,6 +47,7 @@ class UserResponse(BaseModel):
 class LoginResponse(BaseModel):
     user: UserResponse
     token: str
+    refresh_token: str
 
 
 # Instance Schemas
@@ -75,7 +76,7 @@ class InstanceCreate(BaseModel):
     # 资源类型与节点类型
     resource_type: str = "vGPU"       # vGPU / no_gpu
     node_type: str = "center"         # center / edge
-    instance_count: int = 1
+    instance_count: int = Field(default=1, ge=1, le=5)
 
     # 环境变量与存储
     env_vars: Optional[List[EnvVarItem]] = None
