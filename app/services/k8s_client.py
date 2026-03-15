@@ -978,6 +978,66 @@ class K8sClient:
             print(f"[K8s] Error listing node metrics: {e}")
             return []
 
+    def list_pod_metrics(self, namespace: str = "", all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 Pod 资源指标（等价于 kubectl top pod）"""
+        if not self._initialized:
+            return []
+        try:
+            if all_namespaces or not namespace:
+                metrics_list = self.custom_objects.list_cluster_custom_object(
+                    group="metrics.k8s.io",
+                    version="v1beta1",
+                    plural="pods",
+                )
+            else:
+                metrics_list = self.custom_objects.list_namespaced_custom_object(
+                    group="metrics.k8s.io",
+                    version="v1beta1",
+                    namespace=namespace,
+                    plural="pods",
+                )
+            results = []
+            for item in metrics_list.get("items", []):
+                meta = item.get("metadata", {})
+                pod_name = meta.get("name", "")
+                pod_ns = meta.get("namespace", "")
+                # 累加所有容器的 CPU 和内存
+                total_cpu_mc = 0
+                total_mem_bytes = 0
+                for container in item.get("containers", []):
+                    usage = container.get("usage", {})
+                    cpu_raw = usage.get("cpu", "0")
+                    mem_raw = usage.get("memory", "0")
+                    # 解析 CPU
+                    if cpu_raw.endswith('n'):
+                        total_cpu_mc += int(cpu_raw[:-1]) // 1000000
+                    elif cpu_raw.endswith('u'):
+                        total_cpu_mc += int(cpu_raw[:-1]) // 1000
+                    elif cpu_raw.endswith('m'):
+                        total_cpu_mc += int(cpu_raw[:-1])
+                    elif cpu_raw.isdigit():
+                        total_cpu_mc += int(cpu_raw) * 1000
+                    # 解析内存
+                    if mem_raw.endswith('Ki'):
+                        total_mem_bytes += int(mem_raw[:-2]) * 1024
+                    elif mem_raw.endswith('Mi'):
+                        total_mem_bytes += int(mem_raw[:-2]) * 1024 * 1024
+                    elif mem_raw.endswith('Gi'):
+                        total_mem_bytes += int(mem_raw[:-2]) * 1024 * 1024 * 1024
+                    elif mem_raw.isdigit():
+                        total_mem_bytes += int(mem_raw)
+                results.append({
+                    "name": pod_name,
+                    "namespace": pod_ns,
+                    "cpu_usage_millicores": total_cpu_mc,
+                    "memory_usage_bytes": total_mem_bytes,
+                    "timestamp": item.get("timestamp"),
+                })
+            return results
+        except Exception as e:
+            print(f"[K8s] Error listing pod metrics: {e}")
+            return []
+
     def get_cluster_version(self) -> Dict[str, Any]:
         """获取集群版本信息"""
         if not self._initialized:

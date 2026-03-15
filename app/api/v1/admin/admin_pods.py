@@ -83,6 +83,30 @@ async def list_pods(
 
     total = len(pods)
     # 前端做客户端分页，后端返回全量数据
+    # 合并 Pod metrics（CPU/内存使用量）
+    try:
+        all_ns_flag = namespace is None or namespace == ""
+        pod_metrics = k8s.list_pod_metrics(
+            namespace=namespace or "default",
+            all_namespaces=all_ns_flag,
+        )
+        # 构建 metrics map: "namespace/name" -> metrics
+        metrics_map = {}
+        for m in pod_metrics:
+            key = f"{m['namespace']}/{m['name']}"
+            metrics_map[key] = m
+        for p in pods:
+            key = f"{p.get('namespace', '')}/{p.get('name', '')}"
+            pm = metrics_map.get(key)
+            if pm:
+                p["cpu_usage_millicores"] = pm["cpu_usage_millicores"]
+                p["memory_usage_bytes"] = pm["memory_usage_bytes"]
+            else:
+                p["cpu_usage_millicores"] = None
+                p["memory_usage_bytes"] = None
+    except Exception:
+        pass  # metrics 获取失败不影响主列表
+
     return {"list": pods, "total": total}
 
 

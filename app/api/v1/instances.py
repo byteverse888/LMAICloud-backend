@@ -240,6 +240,8 @@ async def list_instances(
     # k8s_dep_map: instance_id → 完整 deployment 解析结果
     k8s_dep_map: dict = {}
     k8s_queried = False
+    # pod_metrics_map: pod_name_prefix → metrics
+    pod_metrics_map: dict = {}
     active_instances = [i for i in instances if i.status in ACTIVE_STATUSES]
     if active_instances:
         try:
@@ -258,6 +260,16 @@ async def list_instances(
                         continue
                     k8s_dep_map[iid] = dep
                 k8s_queried = True
+
+                # 获取 Pod metrics（CPU/内存）
+                try:
+                    pod_metrics = await asyncio.to_thread(
+                        k8s.list_pod_metrics, namespace="lmaicloud"
+                    )
+                    for pm in pod_metrics:
+                        pod_metrics_map[pm["name"]] = pm
+                except Exception as e:
+                    logger.warning(f"获取 Pod metrics 失败（不影响主列表）: {e}")
         except Exception as e:
             logger.warning(f"K8s Deployment 状态对齐失败（返回 DB 状态）: {e}")
 
@@ -296,6 +308,17 @@ async def list_instances(
             inst_dict["replicas"] = None
             inst_dict["ready_replicas"] = None
             inst_dict["available_replicas"] = None
+
+        # 附加 Pod metrics（CPU/内存监控）
+        prefix = f"inst-{inst_id[:8]}"
+        cpu_mc = None
+        mem_bytes = None
+        for pname, pm in pod_metrics_map.items():
+            if pname.startswith(prefix):
+                cpu_mc = (cpu_mc or 0) + pm["cpu_usage_millicores"]
+                mem_bytes = (mem_bytes or 0) + pm["memory_usage_bytes"]
+        inst_dict["cpu_usage_millicores"] = cpu_mc
+        inst_dict["memory_usage_bytes"] = mem_bytes
 
         resp_list.append(inst_dict)
 
@@ -911,7 +934,7 @@ async def get_instance_metrics(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取实例监控指标（Prometheus 集成后返回真实数据）"""
+    """获取实例监控指标 - 通过 K8s Metrics API（等价于 kubectl top pod）"""
     result = await db.execute(
         select(Instance).where(
             Instance.id == instance_id,
@@ -922,17 +945,32 @@ async def get_instance_metrics(
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
 
-    # TODO: 接入 Prometheus 后返回真实指标
+    cpu_usage_mc = None
+    memory_usage_bytes = None
+    try:
+        k8s = get_k8s_client()
+        if k8s.is_connected:
+            pod_metrics = await asyncio.to_thread(
+                k8s.list_pod_metrics, namespace="lmaicloud"
+            )
+            # 匹配 instance-id 标签对应的 Pod
+            # Pod 名前缀: inst-{instance_id[:8]}
+            prefix = f"inst-{instance_id[:8]}"
+            for pm in pod_metrics:
+                if pm["name"].startswith(prefix):
+                    cpu_usage_mc = pm["cpu_usage_millicores"]
+                    memory_usage_bytes = pm["memory_usage_bytes"]
+                    break
+    except Exception as e:
+        logger.warning(f"获取实例 {instance_id} Pod metrics 失败: {e}")
+
     return {
         "instance_id": str(instance_id),
         "status": instance.status,
-        "cpu_util": None,
-        "memory_util": None,
+        "cpu_usage_millicores": cpu_usage_mc,
+        "memory_usage_bytes": memory_usage_bytes,
         "gpu_util": None,
         "gpu_memory": None,
-        "disk_util": None,
-        "network_in": None,
-        "network_out": None,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
