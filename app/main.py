@@ -1,9 +1,10 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 
 from app.config import settings
-from app.database import init_db
+from app.database import init_db, AsyncSessionLocal
 from app.tasks import get_arq_pool, close_arq_pool
 from app.logging_config import setup_logging, get_logger
 from app.api.v1 import auth, users, instances, storage, images, billing, market
@@ -14,6 +15,102 @@ from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admi
 
 # 初始化日志系统
 logger = setup_logging()
+
+
+# ── 周期性实例状态同步 ──────────────────────────────────────────────
+async def _periodic_instance_status_sync():
+    """
+    每 30 秒检查 DB 中处于 creating / starting 的实例，
+    从 K8s Deployment 读取真实状态回写 DB，解决镜像拉取超时后状态卡住的问题。
+    """
+    from app.models import Instance
+    from app.services.k8s_client import get_k8s_client
+    from app.services.ws_manager import broadcast_instance_status
+    from app.api.v1.instances import _derive_instance_status
+    from sqlalchemy import select
+    from datetime import datetime, timedelta, timezone
+
+    SYNC_INTERVAL = 30          # 秒
+    CREATING_TIMEOUT = timedelta(minutes=10)  # 超过 10 分钟仍无 Deployment → error
+
+    while True:
+        await asyncio.sleep(SYNC_INTERVAL)
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Instance).where(Instance.status.in_(["creating", "starting"]))
+                )
+                pending = result.scalars().all()
+                if not pending:
+                    continue
+
+                k8s = get_k8s_client()
+                if not k8s.is_connected:
+                    continue
+
+                # 批量获取所有 Deployment
+                deployments = await asyncio.to_thread(
+                    k8s.list_deployments,
+                    namespace="lmaicloud",
+                    label_selector="app=gpu-instance",
+                )
+                dep_map = {}
+                for dep in deployments:
+                    labels = dep.get("labels") or {}
+                    annotations = dep.get("annotations") or {}
+                    iid = labels.get("instance-id") or annotations.get("lmaicloud/instance-id")
+                    if iid:
+                        dep_map[iid] = dep
+
+                now_utc = datetime.now(timezone.utc)
+
+                for inst in pending:
+                    inst_id = str(inst.id)
+                    dep = dep_map.get(inst_id)
+
+                    if dep:
+                        new_status = _derive_instance_status(dep, db_status=inst.status)
+                    else:
+                        # Deployment 不存在
+                        created = inst.created_at
+                        if created and created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        if created and (now_utc - created) > CREATING_TIMEOUT:
+                            new_status = "error"
+                        else:
+                            continue  # 还在创建中，跳过
+
+                    if new_status == inst.status:
+                        continue  # 无变化
+
+                    # 状态发生变化 → 回写 DB
+                    old_status = inst.status
+                    inst.status = new_status
+                    if new_status == "running" and not inst.started_at:
+                        inst.started_at = datetime.utcnow()
+                        # 尝试补充 pod IP
+                        try:
+                            pods = await asyncio.to_thread(
+                                k8s.list_pods,
+                                namespace="lmaicloud",
+                                label_selector=f"instance-id={inst_id}",
+                            )
+                            if pods and pods[0].get("ip"):
+                                inst.internal_ip = pods[0]["ip"]
+                        except Exception:
+                            pass
+
+                    await session.commit()
+                    logger.info(f"[状态同步] 实例 {inst_id}: {old_status} → {new_status}")
+
+                    # WebSocket 广播
+                    try:
+                        await broadcast_instance_status(inst_id, str(inst.user_id), new_status)
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            logger.warning(f"[状态同步] 异常: {e}")
 
 
 @asynccontextmanager
@@ -34,10 +131,19 @@ async def lifespan(app: FastAPI):
     
     logger.info(f"应用启动完成 - {settings.app_name} v1.0.0")
     
+    # 启动周期性实例状态同步任务
+    sync_task = asyncio.create_task(_periodic_instance_status_sync())
+    logger.info("实例状态周期同步任务已启动 (30s)")
+    
     yield
     
     # Shutdown
     logger.info("应用正在关闭...")
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
     try:
         await close_arq_pool()
     except:

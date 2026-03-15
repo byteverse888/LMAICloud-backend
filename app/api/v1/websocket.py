@@ -20,24 +20,15 @@ from app.services.pod_manager import get_pod_manager
 from app.utils.auth import decode_token
 from app.logging_config import get_logger
 
-# SSH相关
-try:
-    import paramiko
-    SSH_AVAILABLE = True
-except ImportError:
-    SSH_AVAILABLE = False
-
 router = APIRouter()
 logger = get_logger("lmaicloud.websocket")
 
 
 class TerminalManager:
-    """终端会话管理器"""
+    """终端会话管理器 - kubectl exec 模式"""
     
     def __init__(self):
         self.active_connections: dict = {}  # instance_id -> WebSocket
-        self.ssh_clients: dict = {}  # instance_id -> SSHClient
-        self.ssh_channels: dict = {}  # instance_id -> Channel
         self.exec_streams: dict = {}  # instance_id -> k8s exec stream
     
     async def connect(self, websocket: WebSocket, instance_id: str):
@@ -47,19 +38,6 @@ class TerminalManager:
     def disconnect(self, instance_id: str):
         if instance_id in self.active_connections:
             del self.active_connections[instance_id]
-        # 关闭SSH连接
-        if instance_id in self.ssh_channels:
-            try:
-                self.ssh_channels[instance_id].close()
-            except:
-                pass
-            del self.ssh_channels[instance_id]
-        if instance_id in self.ssh_clients:
-            try:
-                self.ssh_clients[instance_id].close()
-            except:
-                pass
-            del self.ssh_clients[instance_id]
         # 关闭 exec stream
         if instance_id in self.exec_streams:
             try:
@@ -71,39 +49,9 @@ class TerminalManager:
     async def send_message(self, instance_id: str, message: str):
         if instance_id in self.active_connections:
             await self.active_connections[instance_id].send_text(message)
-    
-    def create_ssh_connection(self, host: str, port: int, password: str, instance_id: str) -> bool:
-        """创建SSH连接"""
-        if not SSH_AVAILABLE:
-            return False
-        try:
-            client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(
-                hostname=host,
-                port=port,
-                username='root',
-                password=password,
-                timeout=10,
-                allow_agent=False,
-                look_for_keys=False
-            )
-            
-            # 创建交互式shell
-            channel = client.invoke_shell(term='xterm-256color', width=120, height=40)
-            channel.setblocking(0)
-            
-            self.ssh_clients[instance_id] = client
-            self.ssh_channels[instance_id] = channel
-            
-            logger.info(f"SSH连接成功 - 实例: {instance_id}, 地址: {host}:{port}")
-            return True
-        except Exception as e:
-            logger.error(f"SSH连接失败 - 实例: {instance_id}, 错误: {e}")
-            return False
 
     def create_exec_connection(self, pod_name: str, namespace: str, instance_id: str, shell: str = "/bin/sh") -> bool:
-        """通过 kubectl exec 创建交互式连接（适用于轻量镜像）"""
+        """通过 kubectl exec 创建交互式连接"""
         try:
             k8s = get_k8s_client()
             resp = k8s.exec_interactive_stream(pod_name, namespace, [shell])
@@ -115,14 +63,6 @@ class TerminalManager:
         except Exception as e:
             logger.error(f"Exec连接失败 - 实例: {instance_id}, 错误: {e}")
             return False
-    
-    def send_to_ssh(self, instance_id: str, data: str):
-        """发送数据到SSH通道"""
-        if instance_id in self.ssh_channels:
-            try:
-                self.ssh_channels[instance_id].send(data)
-            except Exception as e:
-                logger.error(f"SSH发送失败: {e}")
 
     def send_to_exec(self, instance_id: str, data: str):
         """发送数据到 exec stream"""
@@ -154,26 +94,6 @@ class TerminalManager:
     def resize_exec(self, instance_id: str, cols: int, rows: int):
         """调整 exec 终端大小（K8s exec 不直接支持 resize，忽略）"""
         pass
-    
-    def read_from_ssh(self, instance_id: str) -> Optional[str]:
-        """从SSH通道读取数据"""
-        if instance_id not in self.ssh_channels:
-            return None
-        try:
-            channel = self.ssh_channels[instance_id]
-            if channel.recv_ready():
-                return channel.recv(4096).decode('utf-8', errors='replace')
-        except Exception:
-            pass
-        return None
-    
-    def resize_ssh(self, instance_id: str, cols: int, rows: int):
-        """调整终端大小"""
-        if instance_id in self.ssh_channels:
-            try:
-                self.ssh_channels[instance_id].resize_pty(width=cols, height=rows)
-            except Exception:
-                pass
 
 
 terminal_manager = TerminalManager()
@@ -203,7 +123,7 @@ async def websocket_terminal(
     """
     WebSocket 终端连接
     
-    双模式：完整镜像走 SSH，轻量镜像/SSH 不可用时走 kubectl exec
+    通过 kubectl exec 连接到 Pod 容器终端
     """
     # 验证 token
     user = await verify_websocket_token(token)

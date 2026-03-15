@@ -412,7 +412,7 @@ async def create_instance(
     await db.refresh(instance)
     logger.info(f"实例记录已创建 - ID: {instance.id}, 节点: {nd_name}")
 
-    # 后台: 生成 Deployment YAML -> 调用 K8s -> 等待 Pod 就绪
+    # 后台: 生成 Deployment YAML -> 调用 K8s -> 轮询 Pod 就绪
     async def create_k8s_resources(inst_id, k8s_node_name, nd_type):
         pod_manager = get_pod_manager()
         user_envs = None
@@ -444,53 +444,64 @@ async def create_instance(
             apt_source=instance_data.apt_source,
         )
 
-        final_status = "error"
-        pod_ip = ""
-
-        if k8s_result.get("success"):
-            k8s_cli = get_k8s_client()
-            logger.info(f"开始轮询 Pod 就绪状态 - 实例: {inst_id}")
-            # 在线程池中执行同步轮询（内部 time.sleep 不阻塞事件循环）
-            poll_result = await asyncio.to_thread(
-                k8s_cli.wait_for_pod_ready,
-                namespace="lmaicloud",
-                label_selector=f"instance-id={inst_id}",
-                timeout=120,
-                interval=3,
-            )
-            logger.info(f"轮询结果 - 实例: {inst_id}, ready: {poll_result['ready']}, message: {poll_result.get('message', '')}")
-            if poll_result["ready"]:
-                final_status = "running"
-                pod_ip = poll_result.get("pod_ip", "")
-                logger.info(f"Pod 就绪 - 实例: {inst_id}, pod: {poll_result['pod_name']}")
-            else:
-                final_status = "error"
-                logger.error(f"Pod 未就绪 - 实例: {inst_id}, {poll_result['message']}")
-        else:
+        # ── 1) K8s 创建失败 → 直接 error ──
+        if not k8s_result.get("success"):
             logger.error(f"K8s创建失败: {inst_id}, err: {k8s_result.get('error')}")
+            async with AsyncSessionLocal() as session:
+                stmt = select(Instance).where(Instance.id == inst_id)
+                res = await session.execute(stmt)
+                inst = res.scalar_one_or_none()
+                if inst:
+                    inst.status = "error"
+                    inst.deployment_yaml = k8s_result.get("deployment_yaml", "")
+                    await session.commit()
+            try:
+                await broadcast_instance_status(str(inst_id), str(current_user.id), "error")
+            except Exception:
+                pass
+            return
 
+        # ── 2) K8s 创建成功 → 先保存连接信息（status 仍保持 creating）──
         async with AsyncSessionLocal() as session:
             stmt = select(Instance).where(Instance.id == inst_id)
             res = await session.execute(stmt)
             inst = res.scalar_one_or_none()
             if inst:
-                inst.status = final_status
-                inst.ssh_host = k8s_result.get("ssh_host", "")
-                inst.ssh_port = k8s_result.get("ssh_port")
-                inst.ssh_password = k8s_result.get("ssh_password", "")
-                inst.internal_ip = pod_ip or k8s_result.get("internal_ip", "")
                 inst.deployment_yaml = k8s_result.get("deployment_yaml", "")
-                if final_status == "running":
-                    inst.started_at = datetime.utcnow()
                 await session.commit()
-                logger.info(f"实例状态已更新 - {inst_id}: {final_status}")
+                logger.info(f"实例部署信息已保存 - {inst_id}")
+
+        # ── 3) 轮询 Pod 就绪（120s），仅在就绪时写 running ──
+        k8s_cli = get_k8s_client()
+        logger.info(f"开始轮询 Pod 就绪状态 - 实例: {inst_id}")
+        poll_result = await asyncio.to_thread(
+            k8s_cli.wait_for_pod_ready,
+            namespace="lmaicloud",
+            label_selector=f"instance-id={inst_id}",
+            timeout=120,
+            interval=3,
+        )
+
+        if poll_result["ready"]:
+            pod_ip = poll_result.get("pod_ip", "")
+            logger.info(f"Pod 就绪 - 实例: {inst_id}, pod: {poll_result['pod_name']}")
+            async with AsyncSessionLocal() as session:
+                stmt = select(Instance).where(Instance.id == inst_id)
+                res = await session.execute(stmt)
+                inst = res.scalar_one_or_none()
+                if inst:
+                    inst.status = "running"
+                    inst.started_at = datetime.utcnow()
+                    inst.internal_ip = pod_ip
+                    await session.commit()
+                    logger.info(f"实例状态已更新 - {inst_id}: running")
             try:
-                await broadcast_instance_status(
-                    str(inst_id), str(current_user.id),
-                    inst.status if inst else "error"
-                )
+                await broadcast_instance_status(str(inst_id), str(current_user.id), "running")
             except Exception:
                 pass
+        else:
+            # 超时不写 error —— 保持 creating，由周期同步任务后续处理
+            logger.info(f"Pod 未在120s内就绪，保持 creating 等待后续同步 - 实例: {inst_id}, {poll_result.get('message', '')}")
 
     background_tasks.add_task(create_k8s_resources, instance.id, nd_name, instance_data.node_type)
     return instance
@@ -623,27 +634,25 @@ async def start_instance(
             interval=3,
         )
         if poll_result["ready"]:
-            final_status = "running"
             logger.info(f"Pod 就绪(启动) - 实例: {inst_id}, pod: {poll_result['pod_name']}")
-        else:
-            final_status = "error"
-            logger.error(f"Pod 未就绪(启动) - 实例: {inst_id}, {poll_result['message']}")
-
-        async with AsyncSessionLocal() as session:
-            stmt = select(Instance).where(Instance.id == inst_id)
-            res = await session.execute(stmt)
-            inst = res.scalar_one_or_none()
-            if inst:
-                inst.status = final_status
-                if final_status == "running":
+            async with AsyncSessionLocal() as session:
+                stmt = select(Instance).where(Instance.id == inst_id)
+                res = await session.execute(stmt)
+                inst = res.scalar_one_or_none()
+                if inst:
+                    inst.status = "running"
                     pod_ip = poll_result.get("pod_ip", "")
                     if pod_ip:
                         inst.internal_ip = pod_ip
-                await session.commit()
-                logger.info(f"实例状态已更新(启动) - {inst_id}: {final_status}")
-        try:
-            await broadcast_instance_status(str(inst_id), str(user_id), final_status)
-        except Exception:
+                    await session.commit()
+                    logger.info(f"实例状态已更新(启动) - {inst_id}: running")
+            try:
+                await broadcast_instance_status(str(inst_id), str(user_id), "running")
+            except Exception:
+                pass
+        else:
+            # 超时不写 error —— 保持 starting，由周期同步任务后续处理
+            logger.info(f"Pod 未在120s内就绪(启动)，保持 starting 等待后续同步 - 实例: {inst_id}")
             pass
 
     background_tasks.add_task(wait_for_running, instance.id, current_user.id)

@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     
     # 存储
     storage_root: str = "/opt/data/"
+    storage_backend: str = "ipfs"  # ipfs / cos / rustfs / local
+    ipfs_api_url: str = "http://127.0.0.1:5001"  # IPFS API 地址
+    ipfs_gateway_url: str = "http://127.0.0.1:8080"  # IPFS Gateway (wget 下载用)
+    user_storage_default_quota_gb: int = 10  # 默认用户存储配额(GB)
+    user_upload_max_size_mb: int = 50  # 单文件上传上限(MB)
+    user_max_file_count: int = 100  # 每用户最大文件/目录数
+    # COS 预留
+    cos_secret_id: str = ""
+    cos_secret_key: str = ""
+    cos_bucket: str = ""
+    cos_region: str = ""
     
     # GPU Node 默认配置
     default_gpu_hourly_price: float = 5.0  # 元/小时

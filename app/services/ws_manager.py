@@ -97,7 +97,7 @@ async def broadcast_instance_status(
         instance_id: 实例ID
         user_id: 用户ID
         status: 新状态
-        extra_data: 额外数据(ssh_host, ssh_port等)
+        extra_data: 额外数据
     """
     message = {
         "type": "instance_status",

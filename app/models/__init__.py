@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Float, DateTime, Enum, Boolean, ForeignKey, Integer, Text
+from sqlalchemy import Column, String, Float, DateTime, Enum, Boolean, ForeignKey, Integer, Text, BigInteger, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -34,6 +34,8 @@ class AIUser(Base):
     verified = Column(Boolean, default=False)  # 邮箱是否验证
     activation_token = Column(String(100), nullable=True, index=True)  # 邮箱激活令牌
     activation_expires_at = Column(DateTime, nullable=True)  # 激活令牌过期时间
+    storage_quota = Column(BigInteger, default=10 * 1024**3)  # 总存储配额(字节), 默认10GB
+    storage_used = Column(BigInteger, default=0)               # 已用存储空间(字节)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     deleted_at = Column(DateTime, nullable=True)
@@ -41,6 +43,7 @@ class AIUser(Base):
     instances = relationship("Instance", back_populates="ai_user")
     orders = relationship("Order", back_populates="ai_user")
     recharges = relationship("Recharge", back_populates="ai_user")
+    files = relationship("UserFile", back_populates="owner")
 
 
 # 保留User别名用于兼容（实际指向AIUser）
@@ -310,6 +313,36 @@ class Storage(Base):
     is_directory = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class UserFile(Base):
+    """用户文件表 - 虚拟目录树 + 存储后端映射"""
+    __tablename__ = "user_files"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    parent_id = Column(UUID(as_uuid=True), ForeignKey("user_files.id"), nullable=True, index=True)
+
+    name = Column(String(255), nullable=False)
+    path = Column(String(1000), nullable=False)  # 完整路径, 如 /datasets/train/
+    is_dir = Column(Boolean, default=False)
+
+    size = Column(BigInteger, default=0)       # 文件大小(字节), 目录为0
+    mime_type = Column(String(100))            # MIME类型
+    storage_backend = Column(String(20), default="ipfs")  # ipfs / cos / rustfs / local
+    storage_key = Column(String(500))          # IPFS CID / COS key / 文件路径
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    owner = relationship("AIUser", back_populates="files")
+    parent = relationship("UserFile", remote_side="UserFile.id", backref="children")
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'parent_id', 'name', name='uq_user_parent_name'),
+        # PG 中 NULL!=NULL, 需要 partial index 保证根目录下不重名
+        Index('uq_user_root_name', 'user_id', 'name', unique=True, postgresql_where=text('parent_id IS NULL')),
+    )
 
 
 class AppImageStatus(str, enum.Enum):

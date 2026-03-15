@@ -187,7 +187,7 @@ async def check_instance_health_task(ctx: dict, instance_id: str) -> dict:
     """
     print(f"[HEALTH] Checking health for instance: {instance_id}")
     # TODO: 实际的健康检查逻辑
-    # 1. SSH 连接测试
+    # 1. Pod 状态检查
     # 2. GPU 状态检查
     # 3. 更新实例健康状态
     

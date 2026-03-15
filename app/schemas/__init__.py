@@ -148,9 +148,6 @@ class InstanceResponse(BaseModel):
     image_url: Optional[str] = None
     billing_type: str
     hourly_price: float
-    ssh_host: Optional[str] = None
-    ssh_port: Optional[int] = None
-    ssh_password: Optional[str] = None
     internal_ip: Optional[str] = None
     health_status: Optional[str] = "unknown"
     startup_command: Optional[str] = None
@@ -286,13 +283,52 @@ class FileUploadResponse(BaseModel):
     name: str
     path: str
     size: int
+    storage_backend: str = "ipfs"
     created_at: datetime
 
 
+class FileItemResponse(BaseModel):
+    id: UUID
+    name: str
+    path: str
+    is_dir: bool
+    size: int = 0
+    mime_type: Optional[str] = None
+    storage_backend: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class FileListResponse(BaseModel):
-    files: list
+    files: List[FileItemResponse]
     total: int
+    page: int
+    page_size: int
     current_path: str
+
+
+class StorageQuotaResponse(BaseModel):
+    used: int       # 已用空间(字节)
+    total: int      # 总配额(字节)
+    remaining: int  # 剩余空间(字节)
+    used_percent: float  # 使用百分比
+    file_count: int = 0  # 当前文件/目录数
+    max_file_count: int = 100  # 文件数上限
+    max_upload_size: int = 50 * 1024 * 1024  # 单文件上传上限(字节)
+
+
+class FileLinkResponse(BaseModel):
+    url: str
+    filename: str
+    expires_in: int = 3600  # 秒
+
+
+class MkdirRequest(BaseModel):
+    path: str = "/"
+    name: str
 
 
 # Pagination

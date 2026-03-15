@@ -32,7 +32,6 @@ class InstanceScheduler:
     ) -> Dict[str, Any]:
         """创建 GPU 实例"""
         pod_name = f"inst-{str(instance_id)[:8]}"
-        ssh_port = 30000 + (hash(str(instance_id)) % 10000)
         
         labels = {
             "app": "lmaicloud-instance",
@@ -56,7 +55,6 @@ class InstanceScheduler:
                         "limits": {"cpu": str(cpu_cores), "memory": f"{memory_gb}Gi", "nvidia.com/gpu": str(gpu_count)},
                     },
                     "env": [{"name": k, "value": v} for k, v in (env_vars or {}).items()],
-                    "ports": [{"containerPort": 22, "name": "ssh"}, {"containerPort": 8888, "name": "jupyter"}],
                     "volumeMounts": [{"name": "data", "mountPath": "/root/data"}],
                 }],
                 "volumes": [{"name": "data", "emptyDir": {"sizeLimit": f"{disk_gb}Gi"}}],
@@ -68,20 +66,7 @@ class InstanceScheduler:
         if not result:
             return {"success": False, "error": "Failed to create pod"}
         
-        # 创建 NodePort Service
-        svc_spec = {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {"name": f"svc-{str(instance_id)[:8]}", "namespace": self.NAMESPACE, "labels": labels},
-            "spec": {
-                "type": "NodePort",
-                "selector": labels,
-                "ports": [{"name": "ssh", "port": 22, "targetPort": 22, "nodePort": ssh_port}],
-            },
-        }
-        self.k8s.create_service(self.NAMESPACE, svc_spec)
-        
-        return {"success": True, "pod_name": pod_name, "ssh_port": ssh_port, "status": "Creating"}
+        return {"success": True, "pod_name": pod_name, "status": "Creating"}
     
     def stop_instance(self, instance_id: UUID) -> bool:
         """停止实例"""
@@ -91,7 +76,6 @@ class InstanceScheduler:
     def release_instance(self, instance_id: UUID) -> bool:
         """释放实例（删除所有资源）"""
         prefix = str(instance_id)[:8]
-        self.k8s.delete_service(f"svc-{prefix}", self.NAMESPACE)
         return self.k8s.delete_pod(f"inst-{prefix}", self.NAMESPACE)
     
     def get_instance_status(self, instance_id: UUID) -> Optional[Dict[str, Any]]:
