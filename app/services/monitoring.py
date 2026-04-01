@@ -67,9 +67,9 @@ class MonitoringService:
             "checked_at": datetime.utcnow().isoformat(),
         }
     
-    def check_instance_health(self, instance_id: str) -> Dict[str, Any]:
+    def check_instance_health(self, instance_id: str, namespace: str = "lmaicloud") -> Dict[str, Any]:
         """检查实例健康"""
-        pod = self.k8s.get_pod(f"inst-{instance_id[:8]}", "lmaicloud-instances")
+        pod = self.k8s.get_pod(f"inst-{instance_id[:8]}", namespace)
         if not pod:
             return {"healthy": False, "reason": "Instance not found"}
         

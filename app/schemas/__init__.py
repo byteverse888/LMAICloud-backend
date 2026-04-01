@@ -11,11 +11,14 @@ class UserCreate(BaseModel):
     nickname: Optional[str] = None
     password: str
     role: Optional[str] = "user"  # user 或 admin
+    invite_code: Optional[str] = None  # 邀请码
 
 
 class UserLogin(BaseModel):
     email: EmailStr
     password: str
+    captcha_id: Optional[str] = None
+    captcha_code: Optional[str] = None
 
 
 class Token(BaseModel):
@@ -35,6 +38,8 @@ class UserResponse(BaseModel):
     role: str
     balance: float
     frozen_balance: float
+    points: int = 0
+    invite_code: Optional[str] = None
     status: str
     verified: bool = False
     created_at: datetime
@@ -149,6 +154,7 @@ class InstanceResponse(BaseModel):
     billing_type: str
     hourly_price: float
     internal_ip: Optional[str] = None
+    namespace: Optional[str] = "lmaicloud"  # K8s 命名空间
     health_status: Optional[str] = "unknown"
     startup_command: Optional[str] = None
     env_vars: Optional[str] = None  # JSON string
@@ -218,11 +224,15 @@ class ImageResponse(BaseModel):
 class OrderResponse(BaseModel):
     id: UUID
     user_id: UUID
-    instance_id: Optional[UUID]
+    instance_id: Optional[UUID] = None
+    openclaw_instance_id: Optional[UUID] = None
     type: str
     amount: float
     status: str
-    paid_at: Optional[datetime]
+    description: Optional[str] = None
+    product_name: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    paid_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
@@ -240,8 +250,9 @@ class RechargeResponse(BaseModel):
     user_id: UUID
     amount: float
     payment_method: str
-    transaction_id: Optional[str]
+    transaction_id: Optional[str] = None
     status: str
+    paid_at: Optional[datetime] = None
     created_at: datetime
 
     class Config:
@@ -378,6 +389,322 @@ class TicketResponse(BaseModel):
     user_email: Optional[str] = None
     user_nickname: Optional[str] = None
     handler_nickname: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ========== OpenClaw Schemas ==========
+
+# -- 实例 --
+class OpenClawInstanceCreate(BaseModel):
+    name: str
+    node_name: Optional[str] = None  # K8s 节点名；空则由调度器选择
+    node_type: str = "center"  # center / edge
+    cpu_cores: int = 2
+    memory_gb: int = 4
+    disk_gb: int = 20
+    image_url: Optional[str] = None  # 空则使用默认 OpenClaw 镜像
+    port: int = 18789
+
+
+class OpenClawInstanceResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    name: str
+    status: str
+    namespace: Optional[str] = None
+    node_name: Optional[str] = None
+    node_type: str = "center"
+    cpu_cores: int = 2
+    memory_gb: int = 4
+    disk_gb: int = 20
+    image_url: Optional[str] = None
+    port: int = 18789
+    deployment_name: Optional[str] = None
+    service_name: Optional[str] = None
+    internal_ip: Optional[str] = None
+    gateway_token: Optional[str] = None
+    started_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OpenClawSpecUpdate(BaseModel):
+    cpu_cores: Optional[int] = None
+    memory_gb: Optional[int] = None
+    disk_gb: Optional[int] = None
+
+
+# -- 大模型密钥 --
+class ModelKeyCreate(BaseModel):
+    provider: str  # openai/anthropic/deepseek/qwen/...
+    alias: Optional[str] = None
+    api_key: str
+    base_url: Optional[str] = None
+    model_name: Optional[str] = None
+
+
+class ModelKeyUpdate(BaseModel):
+    alias: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ModelKeyResponse(BaseModel):
+    id: UUID
+    instance_id: UUID
+    provider: str
+    alias: Optional[str] = None
+    api_key_masked: str = ""  # 前端展示脱敏后的 key
+    base_url: Optional[str] = None
+    model_name: Optional[str] = None
+    is_active: bool = True
+    last_check_at: Optional[datetime] = None
+    check_status: str = "unknown"
+    balance: Optional[float] = None
+    tokens_used: int = 0
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# -- 通道配置 --
+class ChannelCreate(BaseModel):
+    type: str  # telegram/discord/wechat/feishu/dingtalk/whatsapp/qq
+    name: Optional[str] = None
+    config: str  # JSON 字符串
+
+
+class ChannelUpdate(BaseModel):
+    name: Optional[str] = None
+    config: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ChannelResponse(BaseModel):
+    id: UUID
+    instance_id: UUID
+    type: str
+    name: Optional[str] = None
+    config: Optional[str] = None
+    is_active: bool = True
+    online_status: str = "unknown"
+    last_check_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# -- Skills --
+class SkillInstall(BaseModel):
+    name: str
+    version: Optional[str] = None
+    description: Optional[str] = None
+
+
+class SkillResponse(BaseModel):
+    id: UUID
+    instance_id: UUID
+    name: str
+    description: Optional[str] = None
+    status: str = "installing"
+    version: Optional[str] = None
+    installed_at: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# -- 监控 --
+class MonitorModelResponse(BaseModel):
+    key_id: UUID
+    provider: str
+    alias: Optional[str] = None
+    check_status: str = "unknown"
+    balance: Optional[float] = None
+    tokens_used: int = 0
+    last_check_at: Optional[datetime] = None
+
+
+class MonitorChannelResponse(BaseModel):
+    channel_id: UUID
+    type: str
+    name: Optional[str] = None
+    online_status: str = "unknown"
+    last_check_at: Optional[datetime] = None
+
+
+class MonitorStatusResponse(BaseModel):
+    instance_id: UUID
+    status: str
+    internal_ip: Optional[str] = None
+    port: int = 18789
+    gateway_version: Optional[str] = None
+    uptime: Optional[int] = None
+    session_count: Optional[int] = None
+    model_keys_total: int = 0
+    model_keys_ok: int = 0
+    channels_total: int = 0
+    channels_online: int = 0
+    skills_installed: int = 0
+    health: bool = False
+    ready: bool = False
+
+
+# ========== 资源套餐 Schemas ==========
+
+class ResourcePlanCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    plan_type: str = "package"  # package / custom
+    billing_cycle: str = "monthly"  # hourly/daily/monthly/yearly
+    cpu_cores: int = 0
+    memory_gb: int = 0
+    gpu_count: int = 0
+    gpu_model: Optional[str] = None
+    disk_gb: int = 0
+    price: float
+    original_price: Optional[float] = None
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class ResourcePlanUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    plan_type: Optional[str] = None
+    billing_cycle: Optional[str] = None
+    cpu_cores: Optional[int] = None
+    memory_gb: Optional[int] = None
+    gpu_count: Optional[int] = None
+    gpu_model: Optional[str] = None
+    disk_gb: Optional[int] = None
+    price: Optional[float] = None
+    original_price: Optional[float] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class ResourcePlanResponse(BaseModel):
+    id: UUID
+    name: str
+    description: Optional[str] = None
+    plan_type: str
+    billing_cycle: str
+    cpu_cores: int
+    memory_gb: int
+    gpu_count: int
+    gpu_model: Optional[str] = None
+    disk_gb: int
+    price: float
+    original_price: Optional[float] = None
+    is_active: bool
+    sort_order: int
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ========== 积分 Schemas ==========
+
+class PointRecordResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    points: int
+    type: str
+    description: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ========== 操作日志 Schemas ==========
+
+class AuditLogResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    action: str
+    resource_type: str
+    resource_id: Optional[str] = None
+    resource_name: Optional[str] = None
+    detail: Optional[str] = None
+    ip_address: Optional[str] = None
+    user_email: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ========== 通知 Schemas ==========
+
+class NotificationResponse(BaseModel):
+    id: UUID
+    user_id: UUID
+    title: str
+    content: Optional[str] = None
+    type: str
+    is_read: bool = False
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# ========== 市场产品 Schemas ==========
+
+class MarketProductCreate(BaseModel):
+    category: str  # compute / ai_app
+    name: str
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    specs: Optional[str] = None  # JSON string
+    price: float = 0
+    price_unit: str = "元/小时"
+    tags: Optional[str] = None  # JSON string
+    sort_order: int = 0
+    is_active: bool = True
+
+
+class MarketProductUpdate(BaseModel):
+    category: Optional[str] = None
+    name: Optional[str] = None
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    specs: Optional[str] = None
+    price: Optional[float] = None
+    price_unit: Optional[str] = None
+    tags: Optional[str] = None
+    sort_order: Optional[int] = None
+    is_active: Optional[bool] = None
+
+
+class MarketProductResponse(BaseModel):
+    id: UUID
+    category: str
+    name: str
+    description: Optional[str] = None
+    icon: Optional[str] = None
+    specs: Optional[str] = None
+    price: float
+    price_unit: str = "元/小时"
+    tags: Optional[str] = None
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

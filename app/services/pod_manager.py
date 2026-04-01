@@ -18,10 +18,15 @@ from app.services.k8s_client import get_k8s_client
 class PodManager:
     """GPU Pod 管理器 - 基于 Deployment"""
 
-    NAMESPACE = "lmaicloud"
+    NAMESPACE_PREFIX = "lmai"  # 命名空间前缀
 
     def __init__(self):
         self.k8s = get_k8s_client()
+
+    @staticmethod
+    def user_namespace(user_id: str) -> str:
+        """根据用户ID生成 K8s 命名空间名称: lmai-{user_id[:8]}"""
+        return f"lmai-{str(user_id).replace('-', '')[:8]}"
 
     # ========== YAML 构建 ==========
 
@@ -44,6 +49,7 @@ class PodManager:
         pip_source: str = "default",
         conda_source: str = "default",
         apt_source: str = "default",
+        namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         构建完整的 Deployment YAML
@@ -194,7 +200,7 @@ class PodManager:
             "kind": "Deployment",
             "metadata": {
                 "name": f"inst-{short_id}",
-                "namespace": self.NAMESPACE,
+                "namespace": namespace or self.user_namespace(user_id),
                 "labels": labels,
                 "annotations": {
                     "lmaicloud/instance-name": instance_name,
@@ -255,6 +261,7 @@ class PodManager:
         pip_source: str = "default",
         conda_source: str = "default",
         apt_source: str = "default",
+        namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         创建 GPU 实例 (Deployment)
@@ -268,7 +275,8 @@ class PodManager:
                 "error": str (if failed)
             }
         """
-        self.k8s.ensure_namespace(self.NAMESPACE)
+        ns = namespace or self.user_namespace(user_id)
+        self.k8s.ensure_namespace(ns)
 
         # 构建 Deployment YAML
         deployment_spec = self.build_deployment_yaml(
@@ -289,13 +297,14 @@ class PodManager:
             pip_source=pip_source,
             conda_source=conda_source,
             apt_source=apt_source,
+            namespace=ns,
         )
 
         # 保存 YAML 文件
         yaml_str = self.generate_deployment_yaml_file(deployment_spec, instance_id)
 
         # 创建 Deployment
-        dep_name = self.k8s.create_deployment(self.NAMESPACE, deployment_spec)
+        dep_name = self.k8s.create_deployment(ns, deployment_spec)
         if not dep_name:
             return {"success": False, "error": "Failed to create Deployment"}
 
@@ -303,27 +312,28 @@ class PodManager:
             "success": True,
             "deployment_name": dep_name,
             "deployment_yaml": yaml_str,
+            "namespace": ns,
             "internal_ip": "",
         }
 
-    def start_instance(self, instance_id: str) -> bool:
+    def start_instance(self, instance_id: str, namespace: str = "lmaicloud") -> bool:
         """启动实例 - 将 Deployment replicas 设为 1"""
         dep_name = f"inst-{instance_id[:8]}"
-        return self.k8s.scale_deployment(dep_name, self.NAMESPACE, 1)
+        return self.k8s.scale_deployment(dep_name, namespace, 1)
 
-    def stop_instance(self, instance_id: str) -> bool:
+    def stop_instance(self, instance_id: str, namespace: str = "lmaicloud") -> bool:
         """停止实例 - 将 Deployment replicas 设为 0 (保留配置)"""
         dep_name = f"inst-{instance_id[:8]}"
-        return self.k8s.scale_deployment(dep_name, self.NAMESPACE, 0)
+        return self.k8s.scale_deployment(dep_name, namespace, 0)
 
-    def release_instance(self, instance_id: str) -> bool:
+    def release_instance(self, instance_id: str, namespace: str = "lmaicloud") -> bool:
         """删除实例 - 删除 Deployment（Pod 随 Deployment 级联删除）"""
         dep_name = f"inst-{instance_id[:8]}"
-        self.k8s.delete_deployment(dep_name, self.NAMESPACE)
+        self.k8s.delete_deployment(dep_name, namespace)
         self._cleanup_yaml_file(instance_id)
         return True
 
-    def force_cleanup_instance(self, instance_id: str) -> bool:
+    def force_cleanup_instance(self, instance_id: str, namespace: str = "lmaicloud") -> bool:
         """
         强制清理实例所有 K8s 资源（不管当前状态）
 
@@ -332,15 +342,15 @@ class PodManager:
         """
         dep_name = f"inst-{instance_id[:8]}"
         # 1. 删除 Deployment
-        self.k8s.delete_deployment(dep_name, self.NAMESPACE)
+        self.k8s.delete_deployment(dep_name, namespace)
         # 2. 强制删除所有关联 Pod（包括孤儿 Pod / Terminating Pod）
         try:
             pods = self.k8s.list_pods(
-                self.NAMESPACE,
+                namespace,
                 label_selector=f"instance-id={instance_id}",
             )
             for pod in (pods or []):
-                self.k8s.delete_pod(pod["name"], self.NAMESPACE, force=True)
+                self.k8s.delete_pod(pod["name"], namespace, force=True)
         except Exception:
             pass  # 忽略 Pod 删除异常
         self._cleanup_yaml_file(instance_id)
@@ -356,28 +366,28 @@ class PodManager:
         except Exception:
             pass
 
-    def get_instance_status(self, instance_id: str) -> Optional[Dict[str, Any]]:
+    def get_instance_status(self, instance_id: str, namespace: str = "lmaicloud") -> Optional[Dict[str, Any]]:
         """获取实例 Deployment 状态"""
         dep_name = f"inst-{instance_id[:8]}"
-        dep = self.k8s.get_deployment(dep_name, self.NAMESPACE)
+        dep = self.k8s.get_deployment(dep_name, namespace)
         if dep:
             return dep
         # fallback: 查找 Pod
         pod_name = f"instance-{instance_id[:8]}"
-        return self.k8s.get_pod(pod_name, self.NAMESPACE)
+        return self.k8s.get_pod(pod_name, namespace)
 
-    def get_instance_logs(self, instance_id: str, tail_lines: int = 100) -> Optional[str]:
+    def get_instance_logs(self, instance_id: str, tail_lines: int = 100, namespace: str = "lmaicloud") -> Optional[str]:
         """获取实例日志 - 查找 Deployment 关联的 Pod"""
         try:
             pods = self.k8s.list_pods(
-                self.NAMESPACE,
+                namespace,
                 label_selector=f"instance-id={instance_id}"
             )
             if pods:
-                return self.k8s.get_pod_logs(pods[0]["name"], self.NAMESPACE, tail_lines)
+                return self.k8s.get_pod_logs(pods[0]["name"], namespace, tail_lines)
             # fallback
             pod_name = f"instance-{instance_id[:8]}"
-            return self.k8s.get_pod_logs(pod_name, self.NAMESPACE, tail_lines)
+            return self.k8s.get_pod_logs(pod_name, namespace, tail_lines)
         except Exception as e:
             print(f"[PodManager] Error getting instance logs for {instance_id}: {e}")
             return None

@@ -3,11 +3,15 @@
 
 所有节点数据从 K8s API 实时获取，不查询 DB nodes 表。
 """
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
 from typing import Optional
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from app.schemas import PaginatedResponse
+from app.database import get_db
+from app.schemas import PaginatedResponse, MarketProductResponse
+from app.models import MarketProduct
 from app.services.k8s_client import get_k8s_client
 
 router = APIRouter()
@@ -191,3 +195,18 @@ async def list_gpu_models():
     gpu_models.sort(key=lambda x: x["available"], reverse=True)
 
     return {"gpu_models": gpu_models}
+
+
+@router.get("/products")
+async def list_market_products(
+    category: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取上架的市场产品列表（公开接口）"""
+    q = select(MarketProduct).where(MarketProduct.is_active == True)
+    if category:
+        q = q.where(MarketProduct.category == category)
+    q = q.order_by(MarketProduct.sort_order)
+    result = await db.execute(q)
+    products = result.scalars().all()
+    return [MarketProductResponse.model_validate(p).model_dump() for p in products]

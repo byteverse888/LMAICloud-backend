@@ -64,6 +64,21 @@ class Settings(BaseSettings):
     
     # 邮箱激活令牌过期时间（小时）
     email_activation_expire_hours: int = 24
+    
+    # 微信支付
+    wechat_app_id: str = ""
+    wechat_mch_id: str = ""
+    wechat_api_key: str = ""
+    wechat_api_v3_key: str = ""
+    wechat_cert_serial_no: str = ""
+    wechat_private_key_path: str = ""
+    wechat_notify_url: str = ""
+
+    # OpenClaw
+    openclaw_default_port: int = 18789
+    openclaw_default_image: str = "ghcr.io/openclaw/openclaw:latest"
+    openclaw_storage_class: str = "standard"
+    openclaw_edge_storage_path: str = "/opt/openclaw-data"
 
     class Config:
         env_file = ".env"

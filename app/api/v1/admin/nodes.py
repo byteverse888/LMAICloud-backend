@@ -26,6 +26,23 @@ def is_edge_node(node: dict) -> bool:
     return False
 
 
+def _calc_cpu_percent(node_name: str, cpu_cores: int, metrics_map: dict) -> float:
+    """计算CPU使用率"""
+    m = metrics_map.get(node_name)
+    if not m or cpu_cores <= 0:
+        return 0.0
+    return round(m.get('cpu_usage_millicores', 0) / (cpu_cores * 1000) * 100, 1)
+
+
+def _calc_mem_percent(node_name: str, memory_gb: int, metrics_map: dict) -> float:
+    """计算内存使用率"""
+    m = metrics_map.get(node_name)
+    if not m or memory_gb <= 0:
+        return 0.0
+    mem_used_gb = m.get('memory_usage_bytes', 0) / (1024 * 1024 * 1024)
+    return round(mem_used_gb / memory_gb * 100, 1)
+
+
 @router.get("/")
 async def list_nodes(
     status: Optional[str] = None,
@@ -40,6 +57,15 @@ async def list_nodes(
         return {"list": [], "total": 0}
     
     k8s_nodes = k8s.list_nodes()
+    
+    # 获取节点资源使用率
+    metrics_map = {}
+    try:
+        metrics = k8s.list_node_metrics()
+        for m in metrics:
+            metrics_map[m['name']] = m
+    except Exception:
+        pass
     
     node_list = []
     for node in k8s_nodes:
@@ -103,6 +129,9 @@ async def list_nodes(
             "memory": memory_gb,
             "ip_address": node.get('ip'),
             "created_at": node.get('created_at'),
+            "cpu_usage_percent": _calc_cpu_percent(node.get('name'), cpu_cores, metrics_map),
+            "memory_usage_percent": _calc_mem_percent(node.get('name'), memory_gb, metrics_map),
+            "gpu_usage_percent": round((node.get('gpu_count', 0) - node.get('gpu_allocatable', 0)) / max(node.get('gpu_count', 1), 1) * 100, 1) if node.get('gpu_count', 0) > 0 else 0,
         })
     
     logger.info(f"获取节点列表 - 总数: {len(node_list)}")

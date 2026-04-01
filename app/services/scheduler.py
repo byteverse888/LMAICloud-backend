@@ -7,17 +7,25 @@ from typing import Optional, List, Dict, Any
 from uuid import UUID
 
 from app.services.k8s_client import get_k8s_client
+from app.services.pod_manager import PodManager
 
 
 class InstanceScheduler:
-    """GPU 实例调度器"""
+    """GPU 实例调度器（旧版 Pod 模式，已被 PodManager 替代）"""
     
-    NAMESPACE = "lmaicloud-instances"
+    DEFAULT_NAMESPACE = "lmaicloud"
     
     def __init__(self):
         self.k8s = get_k8s_client()
-        self.k8s.ensure_namespace(self.NAMESPACE)
     
+    def _ns(self, user_id=None, namespace=None):
+        """Resolve namespace: explicit > user-derived > default"""
+        if namespace:
+            return namespace
+        if user_id:
+            return PodManager.user_namespace(str(user_id))
+        return self.DEFAULT_NAMESPACE
+
     def create_instance(
         self,
         instance_id: UUID,
@@ -29,8 +37,11 @@ class InstanceScheduler:
         memory_gb: int = 32,
         disk_gb: int = 50,
         env_vars: Optional[Dict[str, str]] = None,
+        namespace: Optional[str] = None,
     ) -> Dict[str, Any]:
         """创建 GPU 实例"""
+        ns = self._ns(user_id, namespace)
+        self.k8s.ensure_namespace(ns)
         pod_name = f"inst-{str(instance_id)[:8]}"
         
         labels = {
@@ -43,7 +54,7 @@ class InstanceScheduler:
         pod_spec = {
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {"name": pod_name, "namespace": self.NAMESPACE, "labels": labels},
+            "metadata": {"name": pod_name, "namespace": ns, "labels": labels},
             "spec": {
                 "restartPolicy": "Never",
                 "nodeName": node_name,
@@ -62,25 +73,26 @@ class InstanceScheduler:
         }
         
         # 创建 Pod
-        result = self.k8s.create_pod(self.NAMESPACE, pod_spec)
+        result = self.k8s.create_pod(ns, pod_spec)
         if not result:
             return {"success": False, "error": "Failed to create pod"}
         
         return {"success": True, "pod_name": pod_name, "status": "Creating"}
     
-    def stop_instance(self, instance_id: UUID) -> bool:
+    def stop_instance(self, instance_id: UUID, namespace: str = None) -> bool:
         """停止实例"""
         pod_name = f"inst-{str(instance_id)[:8]}"
-        return self.k8s.delete_pod(pod_name, self.NAMESPACE)
+        return self.k8s.delete_pod(pod_name, namespace or self.DEFAULT_NAMESPACE)
     
-    def release_instance(self, instance_id: UUID) -> bool:
+    def release_instance(self, instance_id: UUID, namespace: str = None) -> bool:
         """释放实例（删除所有资源）"""
         prefix = str(instance_id)[:8]
-        return self.k8s.delete_pod(f"inst-{prefix}", self.NAMESPACE)
+        return self.k8s.delete_pod(f"inst-{prefix}", namespace or self.DEFAULT_NAMESPACE)
     
-    def get_instance_status(self, instance_id: UUID) -> Optional[Dict[str, Any]]:
+    def get_instance_status(self, instance_id: UUID, namespace: str = None) -> Optional[Dict[str, Any]]:
         """获取实例状态"""
-        pod = self.k8s.get_pod(f"inst-{str(instance_id)[:8]}", self.NAMESPACE)
+        ns = namespace or self.DEFAULT_NAMESPACE
+        pod = self.k8s.get_pod(f"inst-{str(instance_id)[:8]}", ns)
         if not pod:
             return None
         return {
@@ -91,9 +103,9 @@ class InstanceScheduler:
             "node_name": pod["node_name"],
         }
     
-    def get_instance_logs(self, instance_id: UUID, tail_lines: int = 100) -> Optional[str]:
+    def get_instance_logs(self, instance_id: UUID, tail_lines: int = 100, namespace: str = None) -> Optional[str]:
         """获取实例日志"""
-        return self.k8s.get_pod_logs(f"inst-{str(instance_id)[:8]}", self.NAMESPACE, tail_lines)
+        return self.k8s.get_pod_logs(f"inst-{str(instance_id)[:8]}", namespace or self.DEFAULT_NAMESPACE, tail_lines)
 
 
 class NodeManager:

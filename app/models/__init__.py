@@ -36,6 +36,11 @@ class AIUser(Base):
     activation_expires_at = Column(DateTime, nullable=True)  # 激活令牌过期时间
     storage_quota = Column(BigInteger, default=10 * 1024**3)  # 总存储配额(字节), 默认10GB
     storage_used = Column(BigInteger, default=0)               # 已用存储空间(字节)
+    # 积分系统
+    points = Column(Integer, default=0)  # 积分余额
+    invite_code = Column(String(20), unique=True, nullable=True, index=True)  # 邀请码
+    invited_by = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=True)  # 邀请人
+    last_checkin_date = Column(String(10), nullable=True)  # 最后签到日期 YYYY-MM-DD
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     deleted_at = Column(DateTime, nullable=True)
@@ -44,6 +49,9 @@ class AIUser(Base):
     orders = relationship("Order", back_populates="ai_user")
     recharges = relationship("Recharge", back_populates="ai_user")
     files = relationship("UserFile", back_populates="owner")
+    point_records = relationship("PointRecord", back_populates="user")
+    notifications = relationship("Notification", back_populates="user")
+    inviter = relationship("AIUser", remote_side="AIUser.id", foreign_keys=[invited_by])
 
 
 # 保留User别名用于兼容（实际指向AIUser）
@@ -193,6 +201,9 @@ class Instance(Base):
     auto_release_type = Column(String(20), default="none")    # none/timer
     auto_release_minutes = Column(Integer, nullable=True)     # 定时释放分钟数
 
+    # K8s 命名空间（按用户隔离）
+    namespace = Column(String(63), default="lmaicloud")  # K8s namespace, 格式: lmai-{user_id[:8]}
+
     # 连接信息
     ssh_host = Column(String(100))
     ssh_port = Column(Integer)
@@ -265,9 +276,13 @@ class Order(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False)
     instance_id = Column(UUID(as_uuid=True), ForeignKey("instances.id"), nullable=True)
+    openclaw_instance_id = Column(UUID(as_uuid=True), ForeignKey("openclaw_instances.id"), nullable=True)
     type = Column(Enum(OrderType), nullable=False)
     amount = Column(Float, nullable=False)
     status = Column(Enum(OrderStatus), default=OrderStatus.PENDING)
+    description = Column(Text, nullable=True)      # 订单描述
+    product_name = Column(String(100), nullable=True)  # 产品名称
+    billing_cycle = Column(String(20), nullable=True)  # 计费周期: hourly/daily/monthly/yearly
     paid_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
 
@@ -296,6 +311,7 @@ class Recharge(Base):
     payment_method = Column(Enum(PaymentMethod), nullable=False)
     transaction_id = Column(String(100))
     status = Column(Enum(RechargeStatus), default=RechargeStatus.PENDING)
+    paid_at = Column(DateTime, nullable=True)  # 实际支付时间
     created_at = Column(DateTime, default=datetime.utcnow)
 
     ai_user = relationship("AIUser", back_populates="recharges")
@@ -424,5 +440,267 @@ class SystemSetting(Base):
     value = Column(Text)  # 设置值 (JSON字符串)
     description = Column(String(255))  # 描述
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ========== OpenClaw 实例管理 ==========
+
+class OpenClawInstance(Base):
+    """OpenClaw AI Agent 实例表"""
+    __tablename__ = "openclaw_instances"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)
+    status = Column(String(20), default="creating")  # creating/running/stopped/error/releasing/released
+
+    # K8s 调度
+    namespace = Column(String(63))  # lmai-{user_id[:8]}
+    node_name = Column(String(200))  # 指定调度节点
+    node_type = Column(String(20), default="center")  # center / edge
+
+    # 资源规格
+    cpu_cores = Column(Integer, default=2)
+    memory_gb = Column(Integer, default=4)
+    disk_gb = Column(Integer, default=20)
+
+    # 镜像 & 端口
+    image_url = Column(String(500))  # Docker 镜像地址
+    port = Column(Integer, default=18789)  # Gateway 端口
+
+    # K8s 资源名
+    deployment_name = Column(String(200))
+    service_name = Column(String(200))
+
+    # 连接信息
+    internal_ip = Column(String(50))
+    gateway_token = Column(String(200))  # Gateway Bearer Token
+
+    # 生命周期
+    started_at = Column(DateTime)
+    created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # 关系
+    user = relationship("AIUser")
+    model_keys = relationship("ModelKey", back_populates="instance", cascade="all, delete-orphan")
+    channels = relationship("Channel", back_populates="instance", cascade="all, delete-orphan")
+    skills = relationship("OpenClawSkill", back_populates="instance", cascade="all, delete-orphan")
+
+
+class ModelKey(Base):
+    """大模型 API 密钥表"""
+    __tablename__ = "openclaw_model_keys"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    instance_id = Column(UUID(as_uuid=True), ForeignKey("openclaw_instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    provider = Column(String(50), nullable=False)  # openai/anthropic/deepseek/qwen/...
+    alias = Column(String(100))  # 用户自定义别名
+    api_key = Column(String(500), nullable=False)  # API Key（生产环境应加密）
+    base_url = Column(String(300))  # 自定义 endpoint（兼容 OpenAI 协议的第三方）
+    model_name = Column(String(100))  # 默认模型名
+    is_active = Column(Boolean, default=True)
+
+    # 监控字段（由 ARQ 定时任务回写）
+    last_check_at = Column(DateTime)
+    check_status = Column(String(20), default="unknown")  # ok/error/quota_low/unknown
+    balance = Column(Float)  # 余额（如果 provider 支持查询）
+    tokens_used = Column(BigInteger, default=0)  # 累计 Token 消耗
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    instance = relationship("OpenClawInstance", back_populates="model_keys")
+
+
+class Channel(Base):
+    """消息通道配置表"""
+    __tablename__ = "openclaw_channels"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    instance_id = Column(UUID(as_uuid=True), ForeignKey("openclaw_instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    type = Column(String(30), nullable=False)  # telegram/discord/wechat/feishu/dingtalk/whatsapp/qq
+    name = Column(String(100))  # 显示名称
+    config = Column(Text)  # JSON: {"token": "xxx", "webhook_url": "xxx", "app_id": "xxx", ...}
+    is_active = Column(Boolean, default=True)
+
+    # 监控字段
+    online_status = Column(String(20), default="unknown")  # online/offline/error/unknown
+    last_check_at = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    instance = relationship("OpenClawInstance", back_populates="channels")
+
+
+class OpenClawSkill(Base):
+    """OpenClaw Skills 技能表"""
+    __tablename__ = "openclaw_skills"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    instance_id = Column(UUID(as_uuid=True), ForeignKey("openclaw_instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String(100), nullable=False)  # 技能名称（目录名）
+    description = Column(Text)
+    status = Column(String(20), default="installing")  # installed/installing/uninstalling/error
+    version = Column(String(50))
+    installed_at = Column(DateTime)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    instance = relationship("OpenClawInstance", back_populates="skills")
+
+
+# ========== 资源套餐 ==========
+
+class PlanType(str, enum.Enum):
+    PACKAGE = "package"  # 固定套餐
+    CUSTOM = "custom"    # 自定义规格单价
+
+
+class BillingCycle(str, enum.Enum):
+    HOURLY = "hourly"
+    DAILY = "daily"
+    MONTHLY = "monthly"
+    YEARLY = "yearly"
+
+
+class ResourcePlan(Base):
+    """资源套餐表"""
+    __tablename__ = "resource_plans"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(100), nullable=False)
+    description = Column(Text, nullable=True)
+    plan_type = Column(Enum(PlanType), default=PlanType.PACKAGE)
+    billing_cycle = Column(Enum(BillingCycle), default=BillingCycle.MONTHLY)
+
+    # 资源规格
+    cpu_cores = Column(Integer, default=0)
+    memory_gb = Column(Integer, default=0)
+    gpu_count = Column(Integer, default=0)
+    gpu_model = Column(String(100), nullable=True)
+    disk_gb = Column(Integer, default=0)
+
+    # 价格
+    price = Column(Float, nullable=False)            # 单周期价格
+    original_price = Column(Float, nullable=True)    # 原价（展示折扣用）
+
+    # 状态
+    is_active = Column(Boolean, default=True)
+    sort_order = Column(Integer, default=0)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# ========== 积分系统 ==========
+
+class PointType(str, enum.Enum):
+    RECHARGE_REWARD = "recharge_reward"  # 充值奖励
+    DAILY_LOGIN = "daily_login"          # 每日签到
+    INVITE_REWARD = "invite_reward"      # 邀请奖励
+    CONSUME = "consume"                  # 积分消费
+
+
+class PointRecord(Base):
+    """积分流水表"""
+    __tablename__ = "point_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    points = Column(Integer, nullable=False)  # 正数=获得, 负数=消费
+    type = Column(Enum(PointType), nullable=False)
+    description = Column(String(500))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("AIUser", back_populates="point_records")
+
+
+# ========== 操作日志 ==========
+
+class AuditAction(str, enum.Enum):
+    CREATE = "create"
+    DELETE = "delete"
+    UPDATE = "update"
+    START = "start"
+    STOP = "stop"
+    RESTART = "restart"
+    LOGIN = "login"
+    RECHARGE = "recharge"
+
+
+class AuditResourceType(str, enum.Enum):
+    INSTANCE = "instance"
+    OPENCLAW = "openclaw"
+    STORAGE = "storage"
+    IMAGE = "image"
+    ACCOUNT = "account"
+    BILLING = "billing"
+
+
+class AuditLog(Base):
+    """操作日志表"""
+    __tablename__ = "audit_logs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    action = Column(Enum(AuditAction), nullable=False)
+    resource_type = Column(Enum(AuditResourceType), nullable=False)
+    resource_id = Column(String(100), nullable=True)
+    resource_name = Column(String(200), nullable=True)
+    detail = Column(Text, nullable=True)  # JSON详情
+    ip_address = Column(String(50), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("AIUser")
+
+
+# ========== 站内通知 ==========
+
+class NotificationType(str, enum.Enum):
+    SYSTEM = "system"
+    BILLING = "billing"
+    INSTANCE = "instance"
+    POINTS = "points"
+
+
+class Notification(Base):
+    """站内通知表"""
+    __tablename__ = "notifications"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    title = Column(String(200), nullable=False)
+    content = Column(Text, nullable=True)
+    type = Column(Enum(NotificationType), default=NotificationType.SYSTEM)
+    is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("AIUser", back_populates="notifications")
+
+
+# ========== 市场产品 ==========
+
+class MarketCategory(str, enum.Enum):
+    COMPUTE = "compute"   # 算力市场
+    AI_APP = "ai_app"     # AI应用
+
+
+class MarketProduct(Base):
+    """市场产品表"""
+    __tablename__ = "market_products"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    category = Column(Enum(MarketCategory), nullable=False)
+    name = Column(String(200), nullable=False)
+    description = Column(Text, nullable=True)
+    icon = Column(String(500), nullable=True)
+    specs = Column(Text, nullable=True)  # JSON: {"gpu": "A100", "memory": "80GB", ...}
+    price = Column(Float, default=0)
+    price_unit = Column(String(50), default="元/小时")  # 价格单位
+    tags = Column(Text, nullable=True)  # JSON: ["热门", "推荐"]
+    sort_order = Column(Integer, default=0)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

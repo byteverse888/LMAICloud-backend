@@ -85,6 +85,8 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 # 编辑 .env 填写数据库、Redis等配置
+
+# 复制 k8s 配置文件 到./.k8s_config 
 ```
 
 ### 3. 启动数据库
@@ -110,6 +112,7 @@ python -m app.database
 
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8884
 ```
 
 API文档：http://localhost:8000/docs

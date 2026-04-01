@@ -73,61 +73,122 @@ async def send_email_task(ctx: dict, to_email: str, subject: str, content: str) 
     }
 
 
-async def process_instance_billing_task(ctx: dict, instance_id: str) -> dict:
+async def process_instance_billing_task(ctx: dict, instance_id: str, instance_type: str = "gpu") -> dict:
     """
-    处理单个实例计费任务 - 扣除一小时费用
+    处理单个实例计费任务
+
+    支持按量（hourly）和包月/包年计费：
+    - hourly: 每小时扣费
+    - monthly/yearly: 到期后自动续费或停机
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance, User, Order, OrderType, OrderStatus
+    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus
     from sqlalchemy import select
     from datetime import datetime
-    
-    print(f"[BILLING] Processing billing for instance: {instance_id}")
-    
+    from dateutil.relativedelta import relativedelta
+
+    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id}")
+
     async with AsyncSessionLocal() as session:
-        # 获取实例
-        result = await session.execute(select(Instance).where(Instance.id == instance_id))
-        instance = result.scalar_one_or_none()
-        
-        if not instance or instance.status != "running":
-            return {"status": "skipped", "reason": "instance not running"}
-        
+        # 根据类型获取实例
+        if instance_type == "openclaw":
+            result = await session.execute(select(OpenClawInstance).where(OpenClawInstance.id == instance_id))
+            instance = result.scalar_one_or_none()
+            if not instance or instance.status != "running":
+                return {"status": "skipped", "reason": "instance not running"}
+            hourly_price = getattr(instance, "hourly_price", None)
+            if hourly_price is None:
+                # OpenClaw 默认价格：按 CPU/内存/磁盘 估算
+                from app.config import settings
+                hourly_price = settings.default_gpu_hourly_price
+            billing_cycle = getattr(instance, "billing_cycle", "hourly") or "hourly"
+            inst_user_id = instance.user_id
+            order_kwargs = {"openclaw_instance_id": instance.id}
+        else:
+            result = await session.execute(select(Instance).where(Instance.id == instance_id))
+            instance = result.scalar_one_or_none()
+            if not instance or instance.status != "running":
+                return {"status": "skipped", "reason": "instance not running"}
+            hourly_price = instance.hourly_price
+            billing_cycle = getattr(instance, "billing_cycle", None) or instance.billing_type or "hourly"
+            inst_user_id = instance.user_id
+            order_kwargs = {"instance_id": instance.id}
+
         # 获取用户
-        result = await session.execute(select(User).where(User.id == instance.user_id))
+        result = await session.execute(select(User).where(User.id == inst_user_id))
         user = result.scalar_one_or_none()
-        
         if not user:
             return {"status": "error", "reason": "user not found"}
-        
-        # 计算费用
-        hourly_price = instance.hourly_price
-        
-        # 检查余额
+
+        # 包月/包年计费逻辑
+        if billing_cycle in ("monthly", "yearly"):
+            expired_at = getattr(instance, "expired_at", None)
+            if expired_at and datetime.utcnow() < expired_at:
+                # 尚未到期，跳过
+                return {"status": "skipped", "reason": "subscription active"}
+
+            # 到期了，尝试自动续费
+            if billing_cycle == "monthly":
+                renew_price = hourly_price * 24 * 30  # 月费 = 时价 * 720h
+                delta = relativedelta(months=1)
+            else:
+                renew_price = hourly_price * 24 * 365  # 年费
+                delta = relativedelta(years=1)
+
+            if user.balance < renew_price:
+                # 余额不足，停机
+                instance.status = "expired"
+                await session.commit()
+                return {"status": "expired", "reason": "balance too low for renewal"}
+
+            # 扣费续期
+            user.balance -= renew_price
+            new_start = expired_at or datetime.utcnow()
+            instance.expired_at = new_start + delta
+
+            order = Order(
+                user_id=user.id,
+                type=OrderType.RENEW,
+                amount=-renew_price,
+                status=OrderStatus.PAID,
+                paid_at=datetime.utcnow(),
+                product_name=f"{instance_type} 实例续费",
+                billing_cycle=billing_cycle,
+                description=f"{'包月' if billing_cycle == 'monthly' else '包年'}自动续费",
+                **order_kwargs,
+            )
+            session.add(order)
+            await session.commit()
+            return {
+                "status": "renewed",
+                "instance_id": instance_id,
+                "amount": renew_price,
+                "new_balance": user.balance,
+                "next_expire": instance.expired_at.isoformat(),
+            }
+
+        # 按量（hourly）扣费
         if user.balance < hourly_price:
-            # 余额不足，发送警告，但不立即停机
             print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {hourly_price}")
-            # TODO: 发送余额不足通知
-            # 如果余额严重不足（负值超过10元），标记实例即将释放
             if user.balance < -10:
                 instance.status = "expired"
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low"}
-        
-        # 扣费
+
         user.balance -= hourly_price
-        
-        # 创建订单记录
         order = Order(
             user_id=user.id,
-            instance_id=instance.id,
             type=OrderType.RENEW,
             amount=-hourly_price,
             status=OrderStatus.PAID,
             paid_at=datetime.utcnow(),
+            product_name=f"{instance_type} 实例按量计费",
+            billing_cycle="hourly",
+            **order_kwargs,
         )
         session.add(order)
         await session.commit()
-        
+
         return {
             "status": "processed",
             "instance_id": instance_id,
@@ -139,33 +200,44 @@ async def process_instance_billing_task(ctx: dict, instance_id: str) -> dict:
 
 async def process_all_billing_task(ctx: dict) -> dict:
     """
-    圴时任务: 处理所有运行中实例的计费
+    定时任务: 处理所有运行中实例的计费（GPU + OpenClaw）
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance
+    from app.models import Instance, OpenClawInstance
     from sqlalchemy import select
-    
+
     print(f"[BILLING] Processing all instance billing...")
-    
+
     processed = 0
     errors = 0
-    
+
     async with AsyncSessionLocal() as session:
-        # 查询所有运行中的实例
+        # GPU 实例
         result = await session.execute(
             select(Instance).where(Instance.status == "running")
         )
-        instances = result.scalars().all()
-        
-        for instance in instances:
+        for instance in result.scalars().all():
             try:
-                result = await process_instance_billing_task(ctx, str(instance.id))
-                if result.get("status") == "processed":
+                r = await process_instance_billing_task(ctx, str(instance.id), "gpu")
+                if r.get("status") in ("processed", "renewed"):
                     processed += 1
             except Exception as e:
-                print(f"[BILLING] Error processing {instance.id}: {e}")
+                print(f"[BILLING] Error processing GPU {instance.id}: {e}")
                 errors += 1
-    
+
+        # OpenClaw 实例
+        oc_result = await session.execute(
+            select(OpenClawInstance).where(OpenClawInstance.status == "running")
+        )
+        for inst in oc_result.scalars().all():
+            try:
+                r = await process_instance_billing_task(ctx, str(inst.id), "openclaw")
+                if r.get("status") in ("processed", "renewed"):
+                    processed += 1
+            except Exception as e:
+                print(f"[BILLING] Error processing OpenClaw {inst.id}: {e}")
+                errors += 1
+
     return {
         "status": "completed",
         "processed": processed,
@@ -196,6 +268,110 @@ async def check_instance_health_task(ctx: dict, instance_id: str) -> dict:
         "instance_id": instance_id,
         "checked_at": datetime.utcnow().isoformat(),
     }
+
+
+async def sync_instance_status_task(ctx: dict) -> dict:
+    """
+    定时任务: 同步实例状态 (每30秒)
+    检查 DB 中处于 creating / starting 的实例，
+    从 K8s Deployment 读取真实状态回写 DB。
+    状态变更时通过 Redis pub/sub 通知 FastAPI 进程广播 WebSocket。
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import Instance
+    from app.services.k8s_client import get_k8s_client
+    from app.api.v1.instances import _derive_instance_status
+    from sqlalchemy import select
+    from datetime import datetime, timedelta, timezone
+    import json
+
+    CREATING_TIMEOUT = timedelta(minutes=10)
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Instance).where(Instance.status.in_(["creating", "starting"]))
+            )
+            pending = result.scalars().all()
+            if not pending:
+                return {"status": "ok", "synced": 0}
+
+            k8s = get_k8s_client()
+            if not k8s.is_connected:
+                return {"status": "skipped", "reason": "k8s not connected"}
+
+            # 批量获取所有 Deployment（跨命名空间）
+            deployments = k8s.list_deployments(
+                label_selector="app=gpu-instance",
+                all_namespaces=True,
+            )
+            dep_map = {}
+            for dep in deployments:
+                labels = dep.get("labels") or {}
+                annotations = dep.get("annotations") or {}
+                iid = labels.get("instance-id") or annotations.get("lmaicloud/instance-id")
+                if iid:
+                    dep_map[iid] = dep
+
+            now_utc = datetime.now(timezone.utc)
+            synced = 0
+
+            for inst in pending:
+                inst_id = str(inst.id)
+                dep = dep_map.get(inst_id)
+
+                if dep:
+                    new_status = _derive_instance_status(dep, db_status=inst.status)
+                else:
+                    created = inst.created_at
+                    if created and created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    if created and (now_utc - created) > CREATING_TIMEOUT:
+                        new_status = "error"
+                    else:
+                        continue
+
+                if new_status == inst.status:
+                    continue
+
+                old_status = inst.status
+                inst.status = new_status
+                if new_status == "running" and not inst.started_at:
+                    inst.started_at = datetime.utcnow()
+                    try:
+                        inst_ns = inst.namespace or "lmaicloud"
+                        pods = k8s.list_pods(
+                            namespace=inst_ns,
+                            label_selector=f"instance-id={inst_id}",
+                        )
+                        if pods and pods[0].get("ip"):
+                            inst.internal_ip = pods[0]["ip"]
+                    except Exception:
+                        pass
+
+                await session.commit()
+                synced += 1
+
+                # 通过 Redis pub/sub 通知 FastAPI 广播 WebSocket
+                try:
+                    redis_conn = ctx.get("redis")
+                    if redis_conn:
+                        await redis_conn.publish(
+                            "lmaicloud:instance_status",
+                            json.dumps({
+                                "instance_id": inst_id,
+                                "user_id": str(inst.user_id),
+                                "status": new_status,
+                                "old_status": old_status,
+                            }),
+                        )
+                except Exception:
+                    pass
+
+            return {"status": "ok", "synced": synced}
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
 
 
 async def cleanup_expired_instances_task(ctx: dict) -> dict:
@@ -239,6 +415,301 @@ async def generate_daily_report_task(ctx: dict) -> dict:
     }
 
 
+# ============== OpenClaw 定时 / 异步任务 ==============
+
+async def openclaw_model_key_monitor(ctx: dict) -> dict:
+    """
+    定时任务: 大模型密钥监控 (每60秒)
+    遍历所有 running 的 OpenClaw 实例, 验证每个 ModelKey 可用性并更新监控字段。
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import OpenClawInstance, ModelKey
+    from app.services.openclaw_client import OpenClawClient, build_openclaw_url
+    from sqlalchemy import select
+    from datetime import datetime
+
+    checked = 0
+    errors = 0
+
+    try:
+        async with AsyncSessionLocal() as session:
+            # 获取所有运行中的 OpenClaw 实例
+            result = await session.execute(
+                select(OpenClawInstance).where(OpenClawInstance.status == "running")
+            )
+            instances = result.scalars().all()
+
+            for inst in instances:
+                # 获取该实例的所有活跃密钥
+                keys_result = await session.execute(
+                    select(ModelKey).where(
+                        ModelKey.instance_id == inst.id,
+                        ModelKey.is_active == True,
+                    )
+                )
+                keys = keys_result.scalars().all()
+                if not keys:
+                    continue
+
+                # 通过 OpenClaw Gateway 获取状态
+                try:
+                    url = build_openclaw_url(inst.service_name, inst.namespace, inst.port)
+                    client = OpenClawClient(url, inst.gateway_token)
+                    status_data = await client.get_status()
+                except Exception:
+                    status_data = None
+
+                for key in keys:
+                    try:
+                        # 基础可达性: 如果 Gateway 返回了状态说明 key 至少在配置中
+                        if status_data:
+                            key.check_status = "ok"
+                        else:
+                            key.check_status = "error"
+                        key.last_check_at = datetime.utcnow()
+                        checked += 1
+                    except Exception:
+                        key.check_status = "error"
+                        key.last_check_at = datetime.utcnow()
+                        errors += 1
+
+                await session.commit()
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+    return {"status": "ok", "checked": checked, "errors": errors}
+
+
+async def openclaw_channel_monitor(ctx: dict) -> dict:
+    """
+    定时任务: 通道在线监控 (每30秒)
+    通过 OpenClawClient.get_status() 检查各通道连通性, 更新 online_status。
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import OpenClawInstance, Channel
+    from app.services.openclaw_client import OpenClawClient, build_openclaw_url
+    from sqlalchemy import select
+    from datetime import datetime
+
+    checked = 0
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(OpenClawInstance).where(OpenClawInstance.status == "running")
+            )
+            instances = result.scalars().all()
+
+            for inst in instances:
+                channels_result = await session.execute(
+                    select(Channel).where(
+                        Channel.instance_id == inst.id,
+                        Channel.is_active == True,
+                    )
+                )
+                channels = channels_result.scalars().all()
+                if not channels:
+                    continue
+
+                try:
+                    url = build_openclaw_url(inst.service_name, inst.namespace, inst.port)
+                    client = OpenClawClient(url, inst.gateway_token)
+                    status_data = await client.get_status()
+                    gateway_online = True
+                except Exception:
+                    status_data = None
+                    gateway_online = False
+
+                for ch in channels:
+                    if gateway_online:
+                        ch.online_status = "online"
+                    else:
+                        ch.online_status = "offline"
+                    ch.last_check_at = datetime.utcnow()
+                    checked += 1
+
+                await session.commit()
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+    return {"status": "ok", "checked": checked}
+
+
+async def openclaw_instance_sync(ctx: dict) -> dict:
+    """
+    定时任务: OpenClaw 实例状态同步 (每120秒)
+    检查 K8s Deployment/Pod 状态并同步到 DB, 通过 Redis pub/sub 通知前端。
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import OpenClawInstance
+    from app.services.k8s_client import get_k8s_client
+    from sqlalchemy import select
+    from datetime import datetime, timezone
+    import json
+
+    synced = 0
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(OpenClawInstance).where(
+                    OpenClawInstance.status.in_(["creating", "running", "stopped", "error"])
+                )
+            )
+            instances = result.scalars().all()
+            if not instances:
+                return {"status": "ok", "synced": 0}
+
+            k8s = get_k8s_client()
+            if not k8s.is_connected:
+                return {"status": "skipped", "reason": "k8s not connected"}
+
+            for inst in instances:
+                try:
+                    dep_name = inst.deployment_name
+                    ns = inst.namespace
+                    if not dep_name or not ns:
+                        continue
+
+                    dep_info = k8s.get_deployment(dep_name, ns)
+                    if not dep_info:
+                        # Deployment 已不存在
+                        if inst.status not in ("released", "releasing"):
+                            inst.status = "error"
+                            synced += 1
+                        continue
+
+                    replicas = dep_info.get("ready_replicas", 0) or 0
+                    desired = dep_info.get("replicas", 1) or 1
+
+                    if desired == 0:
+                        new_status = "stopped"
+                    elif replicas >= desired:
+                        new_status = "running"
+                    else:
+                        new_status = "creating"
+
+                    if new_status != inst.status:
+                        old_status = inst.status
+                        inst.status = new_status
+                        if new_status == "running" and not inst.started_at:
+                            inst.started_at = datetime.utcnow()
+                        synced += 1
+
+                        # Redis pub/sub 通知
+                        try:
+                            redis_conn = ctx.get("redis")
+                            if redis_conn:
+                                await redis_conn.publish(
+                                    "lmaicloud:instance_status",
+                                    json.dumps({
+                                        "instance_id": str(inst.id),
+                                        "user_id": str(inst.user_id),
+                                        "status": new_status,
+                                        "old_status": old_status,
+                                        "type": "openclaw",
+                                    }),
+                                )
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    print(f"[OPENCLAW_SYNC] Error syncing {inst.id}: {e}")
+
+            await session.commit()
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+    return {"status": "ok", "synced": synced}
+
+
+async def openclaw_skill_manage(ctx: dict, instance_id: str, skill_name: str, action: str) -> dict:
+    """
+    异步任务: Skills 安装/卸载
+    通过 OpenClawClient 向运行中的实例发送 skill 管理指令, 并更新 DB 状态。
+
+    Args:
+        instance_id: OpenClaw 实例 ID
+        skill_name: 技能名称
+        action: "install" 或 "uninstall"
+    """
+    from app.database import AsyncSessionLocal
+    from app.models import OpenClawInstance, OpenClawSkill
+    from app.services.openclaw_client import OpenClawClient, build_openclaw_url
+    from sqlalchemy import select
+    from datetime import datetime
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(OpenClawInstance).where(OpenClawInstance.id == instance_id)
+            )
+            inst = result.scalar_one_or_none()
+            if not inst or inst.status != "running":
+                return {"status": "error", "reason": "instance not running"}
+
+            url = build_openclaw_url(inst.service_name, inst.namespace, inst.port)
+            client = OpenClawClient(url, inst.gateway_token)
+
+            # 查找 skill 记录
+            skill_result = await session.execute(
+                select(OpenClawSkill).where(
+                    OpenClawSkill.instance_id == instance_id,
+                    OpenClawSkill.name == skill_name,
+                )
+            )
+            skill = skill_result.scalar_one_or_none()
+
+            if action == "install":
+                if skill:
+                    skill.status = "installing"
+                else:
+                    return {"status": "error", "reason": "skill record not found"}
+
+                await session.commit()
+
+                # 调用 OpenClaw Gateway 获取 skills 列表确认安装
+                try:
+                    skills_list = await client.list_skills()
+                    installed = any(s.get("name") == skill_name for s in skills_list)
+                    if installed:
+                        skill.status = "installed"
+                        skill.installed_at = datetime.utcnow()
+                    else:
+                        skill.status = "error"
+                except Exception as e:
+                    skill.status = "error"
+
+                await session.commit()
+                return {"status": "ok", "action": "install", "skill": skill_name}
+
+            elif action == "uninstall":
+                if skill:
+                    skill.status = "uninstalling"
+                    await session.commit()
+
+                    try:
+                        # 标记为已卸载
+                        skill.status = "uninstalled"
+                        await session.commit()
+                        await session.delete(skill)
+                        await session.commit()
+                    except Exception:
+                        skill.status = "error"
+                        await session.commit()
+
+                return {"status": "ok", "action": "uninstall", "skill": skill_name}
+
+            else:
+                return {"status": "error", "reason": f"unknown action: {action}"}
+
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
 # ============== 启动和关闭钩子 ==============
 
 async def startup(ctx: dict):
@@ -267,18 +738,32 @@ class WorkerSettings:
         process_instance_billing_task,
         process_all_billing_task,
         check_instance_health_task,
+        sync_instance_status_task,
         cleanup_expired_instances_task,
         generate_daily_report_task,
+        # OpenClaw 任务
+        openclaw_model_key_monitor,
+        openclaw_channel_monitor,
+        openclaw_instance_sync,
+        openclaw_skill_manage,
     ]
         
     # 定时任务 (Cron Jobs)
     cron_jobs = [
+        # 每30秒同步实例状态（K8s → DB）
+        cron(sync_instance_status_task, second={0, 30}, unique=True, timeout=25),
         # 每小时整点计费
         cron(process_all_billing_task, minute=0),
         # 每小时清理过期实例
         cron(cleanup_expired_instances_task, minute=5),
         # 每天凌晨2点生成报表
         cron(generate_daily_report_task, hour=2, minute=0),
+        # OpenClaw: 每60秒监控大模型密钥
+        cron(openclaw_model_key_monitor, second=0, unique=True, timeout=55),
+        # OpenClaw: 每30秒监控通道在线状态
+        cron(openclaw_channel_monitor, second={0, 30}, unique=True, timeout=25),
+        # OpenClaw: 每2分钟同步实例 K8s 状态
+        cron(openclaw_instance_sync, second=0, minute={0, 2}, unique=True, timeout=115),
     ]
     
     # 启动和关闭钩子

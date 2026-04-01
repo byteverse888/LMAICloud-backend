@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, EmailStr
+from typing import Optional
 import random
 import string
 import secrets
@@ -14,6 +15,8 @@ from app.utils.auth import get_password_hash, verify_password, create_access_tok
 from app.logging_config import get_logger
 from app.config import settings
 from app.services.email_service import send_activation_email, get_email_config
+from app.api.v1.points import add_points
+from app.models import PointType
 import json
 
 router = APIRouter()
@@ -21,6 +24,8 @@ logger = get_logger("lmaicloud.auth")
 
 # 简易验证码存储（生产环境应使用Redis）
 verify_codes: dict[str, dict] = {}
+# 图形验证码缓存 {captcha_id: answer}
+captcha_store: dict[str, dict] = {}
 
 
 class SendCodeRequest(BaseModel):
@@ -51,6 +56,12 @@ class ResendActivationRequest(BaseModel):
 class RefreshTokenRequest(BaseModel):
     """刷新Token请求"""
     refresh_token: str
+
+
+class CaptchaLoginRequest(BaseModel):
+    """带验证码的登录请求"""
+    captcha_id: Optional[str] = None
+    captcha_code: Optional[str] = None
 
 
 def generate_code(length: int = 6) -> str:
@@ -234,9 +245,25 @@ async def register(
         activation_expires_at=datetime.utcnow() + timedelta(hours=expire_hours) if email_verification_required else None
     )
     
+    # 处理邀请码
+    invite_code_value = getattr(user_data, 'invite_code', None)
+    inviter = None
+    if invite_code_value:
+        inviter_result = await db.execute(
+            select(User).where(User.invite_code == invite_code_value)
+        )
+        inviter = inviter_result.scalar_one_or_none()
+        if inviter:
+            user.invited_by = inviter.id
+    
     db.add(user)
     await db.commit()
     await db.refresh(user)
+    
+    # 给邀请人发放50积分奖励
+    if inviter:
+        await add_points(db, inviter.id, 50, PointType.INVITE_REWARD, f"邀请用户 {user.email} 注册奖励")
+        await db.commit()
     
     logger.info(f"用户注册成功: {user.email}, ID: {user.id}")
     
@@ -358,9 +385,68 @@ async def resend_activation_email(
     return {"message": "激活邮件已发送，请查收邮箱"}
 
 
+@router.get("/captcha")
+async def get_captcha(db: AsyncSession = Depends(get_db)):
+    """生成图形验证码"""
+    import io
+    import base64 as b64
+    
+    # 检查是否启用验证码
+    captcha_enabled = await get_setting_value(db, "captcha_enabled", True)
+    if not captcha_enabled:
+        return {"captcha_id": "", "image_base64": "", "enabled": False}
+    
+    # 生成验证码(简单实现，不依赖 captcha 库)
+    chars = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=4))
+    captcha_id = secrets.token_urlsafe(16)
+    
+    # 存储验证码答案
+    captcha_store[captcha_id] = {
+        'answer': chars,
+        'expires_at': datetime.now() + timedelta(minutes=5),
+    }
+    
+    # 清理过期验证码
+    now = datetime.now()
+    expired_keys = [k for k, v in captcha_store.items() if now > v['expires_at']]
+    for k in expired_keys:
+        captcha_store.pop(k, None)
+    
+    # 生成简单的SVG验证码图片
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40">
+        <rect width="120" height="40" fill="#f0f0f0"/>
+        <text x="10" y="30" font-size="28" font-family="Arial" fill="#333"
+              transform="rotate(-5,60,20)" letter-spacing="5">{chars}</text>
+        <line x1="0" y1="{random.randint(10,30)}" x2="120" y2="{random.randint(10,30)}" stroke="#ccc" stroke-width="1"/>
+        <line x1="0" y1="{random.randint(10,30)}" x2="120" y2="{random.randint(10,30)}" stroke="#ddd" stroke-width="1"/>
+    </svg>'''
+    
+    image_base64 = b64.b64encode(svg.encode()).decode()
+    
+    return {
+        "captcha_id": captcha_id,
+        "image_base64": f"data:image/svg+xml;base64,{image_base64}",
+        "enabled": True,
+    }
+
+
 @router.post("/login", response_model=LoginResponse)
 async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
     logger.info(f"用户登录请求: {user_data.email}")
+    
+    # 检查验证码
+    captcha_enabled = await get_setting_value(db, "captcha_enabled", True)
+    if captcha_enabled and user_data.captcha_id:
+        stored = captcha_store.get(user_data.captcha_id)
+        if not stored:
+            raise HTTPException(status_code=400, detail="验证码已过期，请刷新")
+        if datetime.now() > stored['expires_at']:
+            captcha_store.pop(user_data.captcha_id, None)
+            raise HTTPException(status_code=400, detail="验证码已过期，请刷新")
+        if (user_data.captcha_code or "").lower() != stored['answer'].lower():
+            captcha_store.pop(user_data.captcha_id, None)
+            raise HTTPException(status_code=400, detail="验证码错误")
+        captcha_store.pop(user_data.captcha_id, None)
     
     result = await db.execute(select(User).where(User.email == user_data.email))
     user = result.scalar_one_or_none()

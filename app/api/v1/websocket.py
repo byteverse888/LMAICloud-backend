@@ -13,7 +13,7 @@ import threading
 from typing import Optional
 
 from app.database import get_db, async_session_maker
-from app.models import Instance, User
+from app.models import Instance, User, OpenClawInstance
 from app.services.k8s_client import get_k8s_client
 from app.services.ws_manager import get_ws_manager, ws_manager
 from app.services.pod_manager import get_pod_manager
@@ -156,7 +156,7 @@ async def websocket_terminal(
     try:
         # 直接使用 kubectl exec 模式
         k8s = get_k8s_client()
-        namespace = "lmaicloud"
+        namespace = instance.namespace or "lmaicloud"
         try:
             pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
         except Exception as e:
@@ -244,6 +244,252 @@ async def websocket_terminal(
         terminal_manager.disconnect(session_id)
 
 
+@router.websocket("/ws/openclaw/terminal/{instance_id}")
+async def websocket_openclaw_terminal(
+    websocket: WebSocket,
+    instance_id: str,
+    token: str = Query(...)
+):
+    """
+    OpenClaw 实例 WebSocket 终端连接
+
+    通过 kubectl exec 连接到 OpenClaw Pod 容器终端
+    """
+    user = await verify_websocket_token(token)
+    if not user:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    # 验证实例归属
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(OpenClawInstance).where(
+                OpenClawInstance.id == instance_id,
+                OpenClawInstance.user_id == user.id
+            )
+        )
+        instance = result.scalar_one_or_none()
+
+        if not instance:
+            await websocket.close(code=4004, reason="OpenClaw instance not found")
+            return
+
+        if instance.status not in ("running", "error"):
+            await websocket.close(code=4000, reason=f"Instance not available: {instance.status}")
+            return
+
+    session_id = f"oc-{instance_id}:{uuid.uuid4().hex[:8]}"
+    await terminal_manager.connect(websocket, session_id)
+
+    try:
+        k8s = get_k8s_client()
+        namespace = instance.namespace or "lmaicloud"
+        try:
+            pods = k8s.list_pods(namespace, label_selector=f"openclaw-instance={instance_id}")
+        except Exception as e:
+            logger.error(f"OpenClaw K8s list_pods 异常: {e}")
+            pods = []
+        if not pods:
+            await websocket.send_json({
+                "type": "error",
+                "data": "未找到关联的 Pod，K8s 连接可能异常"
+            })
+            return
+        pod_name = pods[0]["name"]
+        try:
+            exec_ok = terminal_manager.create_exec_connection(
+                pod_name=pod_name, namespace=namespace, instance_id=session_id
+            )
+        except Exception as e:
+            logger.error(f"OpenClaw create_exec_connection 异常: {e}")
+            exec_ok = False
+        if not exec_ok:
+            await websocket.send_json({
+                "type": "error",
+                "data": "终端连接失败"
+            })
+            return
+
+        await websocket.send_json({
+            "type": "connected",
+            "data": f"终端已连接 - OpenClaw 实例 {instance_id[:8]}"
+        })
+
+        async def read_output():
+            while True:
+                try:
+                    output = await asyncio.to_thread(
+                        terminal_manager.read_from_exec, session_id
+                    )
+                    if output:
+                        await websocket.send_json({
+                            "type": "output",
+                            "data": output
+                        })
+                except Exception as e:
+                    logger.error(f"OpenClaw read_output 异常 - 实例: {instance_id}, 错误: {e}")
+                    break
+
+        read_task = asyncio.create_task(read_output())
+
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+
+                if message.get("type") == "input":
+                    await asyncio.to_thread(
+                        terminal_manager.send_to_exec, session_id, message.get("data", "")
+                    )
+                elif message.get("type") == "resize":
+                    terminal_manager.resize_exec(
+                        session_id,
+                        message.get("cols", 120),
+                        message.get("rows", 40)
+                    )
+                elif message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+        finally:
+            read_task.cancel()
+
+    except WebSocketDisconnect:
+        logger.info(f"OpenClaw 终端断开连接 - 实例: {instance_id}")
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        logger.error(f"OpenClaw 终端错误 - 实例: {instance_id}, 错误: {e}")
+        try:
+            await websocket.send_json({"type": "error", "data": str(e)})
+        except:
+            pass
+    finally:
+        terminal_manager.disconnect(session_id)
+
+
+@router.websocket("/ws/openclaw/admin/terminal/{instance_id}")
+async def websocket_openclaw_admin_terminal(
+    websocket: WebSocket,
+    instance_id: str,
+    token: str = Query(...)
+):
+    """
+    管理端 OpenClaw 实例 WebSocket 终端连接
+
+    管理员可连接任意 OpenClaw 实例终端（不检查 user_id 归属）
+    """
+    user = await verify_websocket_token(token)
+    if not user:
+        await websocket.close(code=4001, reason="Invalid token")
+        return
+
+    # 验证管理员权限
+    if user.role != "admin":
+        await websocket.close(code=4003, reason="Admin required")
+        return
+
+    # 查找实例（不限制 user_id）
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(OpenClawInstance).where(OpenClawInstance.id == instance_id)
+        )
+        instance = result.scalar_one_or_none()
+
+        if not instance:
+            await websocket.close(code=4004, reason="OpenClaw instance not found")
+            return
+
+        if instance.status not in ("running", "error"):
+            await websocket.close(code=4000, reason=f"Instance not available: {instance.status}")
+            return
+
+    session_id = f"oc-admin-{instance_id}:{uuid.uuid4().hex[:8]}"
+    await terminal_manager.connect(websocket, session_id)
+
+    try:
+        k8s = get_k8s_client()
+        namespace = instance.namespace or "lmaicloud"
+        try:
+            pods = k8s.list_pods(namespace, label_selector=f"openclaw-instance={instance_id}")
+        except Exception as e:
+            logger.error(f"Admin OpenClaw K8s list_pods 异常: {e}")
+            pods = []
+        if not pods:
+            await websocket.send_json({
+                "type": "error",
+                "data": "未找到关联的 Pod，K8s 连接可能异常"
+            })
+            return
+        pod_name = pods[0]["name"]
+        try:
+            exec_ok = terminal_manager.create_exec_connection(
+                pod_name=pod_name, namespace=namespace, instance_id=session_id
+            )
+        except Exception as e:
+            logger.error(f"Admin OpenClaw create_exec_connection 异常: {e}")
+            exec_ok = False
+        if not exec_ok:
+            await websocket.send_json({
+                "type": "error",
+                "data": "终端连接失败"
+            })
+            return
+
+        await websocket.send_json({
+            "type": "connected",
+            "data": f"[管理端] 终端已连接 - OpenClaw 实例 {instance_id[:8]}"
+        })
+
+        async def read_output():
+            while True:
+                try:
+                    output = await asyncio.to_thread(
+                        terminal_manager.read_from_exec, session_id
+                    )
+                    if output:
+                        await websocket.send_json({
+                            "type": "output",
+                            "data": output
+                        })
+                except Exception as e:
+                    logger.error(f"Admin OpenClaw read_output 异常 - 实例: {instance_id}, 错误: {e}")
+                    break
+
+        read_task = asyncio.create_task(read_output())
+
+        try:
+            while True:
+                data = await websocket.receive_text()
+                message = json.loads(data)
+
+                if message.get("type") == "input":
+                    await asyncio.to_thread(
+                        terminal_manager.send_to_exec, session_id, message.get("data", "")
+                    )
+                elif message.get("type") == "resize":
+                    terminal_manager.resize_exec(
+                        session_id,
+                        message.get("cols", 120),
+                        message.get("rows", 40)
+                    )
+                elif message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+        finally:
+            read_task.cancel()
+
+    except WebSocketDisconnect:
+        logger.info(f"Admin OpenClaw 终端断开连接 - 实例: {instance_id}")
+    except json.JSONDecodeError:
+        pass
+    except Exception as e:
+        logger.error(f"Admin OpenClaw 终端错误 - 实例: {instance_id}, 错误: {e}")
+        try:
+            await websocket.send_json({"type": "error", "data": str(e)})
+        except:
+            pass
+    finally:
+        terminal_manager.disconnect(session_id)
+
+
 @router.websocket("/ws/logs/{instance_id}")
 async def websocket_logs(
     websocket: WebSocket,
@@ -286,7 +532,7 @@ async def websocket_logs(
     
     try:
         k8s = get_k8s_client()
-        namespace = "lmaicloud"
+        namespace = instance.namespace or "lmaicloud"
         
         # 通过 label selector 查找 Deployment 关联的 Pod（Pod 名由 ReplicaSet 随机后缀生成）
         try:

@@ -20,7 +20,7 @@ from app.schemas import (
 )
 from app.utils.auth import get_current_user
 from app.services.k8s_client import get_k8s_client
-from app.services.pod_manager import get_pod_manager
+from app.services.pod_manager import get_pod_manager, PodManager
 from app.services.ws_manager import broadcast_instance_status
 from app.logging_config import get_logger
 
@@ -249,8 +249,8 @@ async def list_instances(
             if k8s.is_connected:
                 deployments = await asyncio.to_thread(
                     k8s.list_deployments,
-                    namespace="lmaicloud",
                     label_selector="app=gpu-instance",
+                    all_namespaces=True,
                 )
                 for dep in deployments:
                     labels = dep.get("labels") or {}
@@ -261,10 +261,10 @@ async def list_instances(
                     k8s_dep_map[iid] = dep
                 k8s_queried = True
 
-                # 获取 Pod metrics（CPU/内存）
+                # 获取 Pod metrics（CPU/内存）- 跨命名空间
                 try:
                     pod_metrics = await asyncio.to_thread(
-                        k8s.list_pod_metrics, namespace="lmaicloud"
+                        k8s.list_pod_metrics, all_namespaces=True
                     )
                     for pm in pod_metrics:
                         pod_metrics_map[pm["name"]] = pm
@@ -399,11 +399,13 @@ async def create_instance(
         storage_json = json.dumps([sm.dict() for sm in instance_data.storage_mounts], ensure_ascii=False)
 
     gpu_count = instance_data.gpu_count if instance_data.resource_type != "no_gpu" else 0
+    user_ns = PodManager.user_namespace(str(current_user.id))
     instance = Instance(
         user_id=current_user.id,
         node_id=None,  # 不再关联 DB nodes 表
         node_name=nd_name,
         name=instance_data.name,
+        namespace=user_ns,
         gpu_count=gpu_count,
         gpu_model=instance_data.gpu_model or nd_gpu_model,
         cpu_cores=nd_cpu,
@@ -465,6 +467,7 @@ async def create_instance(
             pip_source=instance_data.pip_source,
             conda_source=instance_data.conda_source,
             apt_source=instance_data.apt_source,
+            namespace=user_ns,
         )
 
         # ── 1) K8s 创建失败 → 直接 error ──
@@ -499,7 +502,7 @@ async def create_instance(
         logger.info(f"开始轮询 Pod 就绪状态 - 实例: {inst_id}")
         poll_result = await asyncio.to_thread(
             k8s_cli.wait_for_pod_ready,
-            namespace="lmaicloud",
+            namespace=user_ns,
             label_selector=f"instance-id={inst_id}",
             timeout=120,
             interval=3,
@@ -562,7 +565,8 @@ async def get_instance(
         k8s = get_k8s_client()
         if k8s.is_connected:
             dep_name = f"inst-{instance_id[:8]}"
-            dep = await asyncio.to_thread(k8s.get_deployment, dep_name, "lmaicloud")
+            inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+            dep = await asyncio.to_thread(k8s.get_deployment, dep_name, inst_ns)
             if dep:
                 dep_info = {
                     "name": dep.get("name"),
@@ -582,7 +586,7 @@ async def get_instance(
             # 获取关联的 Pod 列表
             pods = await asyncio.to_thread(
                 k8s.list_pods,
-                namespace="lmaicloud",
+                namespace=inst_ns,
                 label_selector=f"instance-id={instance_id}",
             )
             for p in (pods or []):
@@ -637,7 +641,8 @@ async def start_instance(
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法启动")
 
     pod_manager = get_pod_manager()
-    success = await asyncio.to_thread(pod_manager.start_instance, str(instance.id))
+    inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+    success = await asyncio.to_thread(pod_manager.start_instance, str(instance.id), inst_ns)
     if not success:
         raise HTTPException(status_code=500, detail="启动失败")
 
@@ -651,7 +656,7 @@ async def start_instance(
         logger.info(f"开始轮询启动后 Pod 就绪状态 - 实例: {inst_id}")
         poll_result = await asyncio.to_thread(
             k8s_cli.wait_for_pod_ready,
-            namespace="lmaicloud",
+            namespace=inst_ns,
             label_selector=f"instance-id={inst_id}",
             timeout=120,
             interval=3,
@@ -702,7 +707,8 @@ async def stop_instance(
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法停止")
 
     pod_manager = get_pod_manager()
-    success = await asyncio.to_thread(pod_manager.stop_instance, str(instance.id))
+    inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+    success = await asyncio.to_thread(pod_manager.stop_instance, str(instance.id), inst_ns)
     if success:
         instance.status = "stopped"
         await db.commit()
@@ -769,7 +775,8 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
     async def cleanup_k8s(inst_id: str):
         try:
             pod_manager = get_pod_manager()
-            await asyncio.to_thread(pod_manager.force_cleanup_instance, str(inst_id))
+            inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+            await asyncio.to_thread(pod_manager.force_cleanup_instance, str(inst_id), inst_ns)
             logger.info(f"实例 {inst_id} K8s 资源已强制清理（Deployment + Pod + Service）")
         except Exception as e:
             logger.warning(f"强制删除 K8s 资源异常（已忽略）: {e}")
@@ -806,7 +813,8 @@ async def release_instance(
         # K8s 清理: 失败不阻塞，DB 状态必须更新
         try:
             pod_manager = get_pod_manager()
-            await asyncio.to_thread(pod_manager.release_instance, str(inst_id))
+            inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+            await asyncio.to_thread(pod_manager.release_instance, str(inst_id), inst_ns)
         except Exception as e:
             logger.warning(f"删除 K8s 资源异常（已忽略）: {e}")
         # 无论 K8s 是否成功，都更新 DB
@@ -883,7 +891,8 @@ async def get_instance_status(
         if k8s.is_connected:
             # 查询 Deployment
             dep_name = f"inst-{instance_id[:8]}"
-            dep = await asyncio.to_thread(k8s.get_deployment, dep_name, "lmaicloud")
+            inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+            dep = await asyncio.to_thread(k8s.get_deployment, dep_name, inst_ns)
             if dep:
                 dep_info = {
                     "name": dep.get("name"),
@@ -905,7 +914,7 @@ async def get_instance_status(
             # 查询关联 Pod
             pods = await asyncio.to_thread(
                 k8s.list_pods,
-                namespace="lmaicloud",
+                namespace=inst_ns,
                 label_selector=f"instance-id={instance_id}",
             )
             if pods:
@@ -950,8 +959,9 @@ async def get_instance_metrics(
     try:
         k8s = get_k8s_client()
         if k8s.is_connected:
+            inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
             pod_metrics = await asyncio.to_thread(
-                k8s.list_pod_metrics, namespace="lmaicloud"
+                k8s.list_pod_metrics, namespace=inst_ns
             )
             # 匹配 instance-id 标签对应的 Pod
             # Pod 名前缀: inst-{instance_id[:8]}
@@ -995,7 +1005,8 @@ async def get_instance_logs(
         raise HTTPException(status_code=404, detail="实例不存在")
 
     pm = get_pod_manager()
-    logs = await asyncio.to_thread(pm.get_instance_logs, instance_id, tail)
+    inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+    logs = await asyncio.to_thread(pm.get_instance_logs, instance_id, tail, inst_ns)
     if logs is None:
         return {"logs": ""}
     return {"logs": logs}

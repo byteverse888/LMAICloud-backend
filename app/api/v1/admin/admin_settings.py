@@ -37,6 +37,19 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "smtp_from_email": "",
     "smtp_from_name": "LMAICloud",
     "smtp_use_tls": True,
+    # 品牌配置
+    "site_logo": "",
+    "footer_text": "",
+    "icp_number": "",
+    "icp_link": "https://beian.miit.gov.cn/",
+    "police_number": "",
+    "copyright_text": "© 2025 LMAICloud. All rights reserved.",
+    # 协议
+    "user_agreement": "",
+    "privacy_policy": "",
+    "service_agreement": "",
+    # 验证码
+    "captcha_enabled": True,
 }
 
 
@@ -56,6 +69,19 @@ class SystemSettingsUpdate(BaseModel):
     registration_enabled: Optional[bool] = None
     email_verification_required: Optional[bool] = None
     notification_email_enabled: Optional[bool] = None
+    # 品牌配置
+    site_logo: Optional[str] = None
+    footer_text: Optional[str] = None
+    icp_number: Optional[str] = None
+    icp_link: Optional[str] = None
+    police_number: Optional[str] = None
+    copyright_text: Optional[str] = None
+    # 协议
+    user_agreement: Optional[str] = None
+    privacy_policy: Optional[str] = None
+    service_agreement: Optional[str] = None
+    # 验证码
+    captcha_enabled: Optional[bool] = None
 
 
 class EmailConfigUpdate(BaseModel):

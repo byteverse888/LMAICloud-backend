@@ -2,115 +2,62 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
+import json
 
 from app.config import settings
-from app.database import init_db, AsyncSessionLocal
+from app.database import init_db
 from app.tasks import get_arq_pool, close_arq_pool
 from app.logging_config import setup_logging, get_logger
-from app.api.v1 import auth, users, instances, storage, images, billing, market
+from app.api.v1 import auth, users, instances, storage, images, billing, market, openclaw
 from app.api.v1 import websocket as ws
-from app.api.v1 import tickets, system
+from app.api.v1 import tickets, system, points, referral, audit_log, notifications
 from app.api.v1.admin import clusters, nodes, admin_users, admin_orders, reports, admin_settings, admin_images, admin_tickets
 from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admin_storage
+from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market
 
 # 初始化日志系统
 logger = setup_logging()
 
 
-# ── 周期性实例状态同步 ──────────────────────────────────────────────
-async def _periodic_instance_status_sync():
+# ── Redis 订阅: 接收 ARQ Worker 的状态变更，转发 WebSocket ──────────
+async def _subscribe_instance_status():
     """
-    每 30 秒检查 DB 中处于 creating / starting 的实例，
-    从 K8s Deployment 读取真实状态回写 DB，解决镜像拉取超时后状态卡住的问题。
+    订阅 Redis 频道 lmaicloud:instance_status，
+    将 ARQ worker 发来的实例状态变更通过 WebSocket 广播给前端。
     """
-    from app.models import Instance
-    from app.services.k8s_client import get_k8s_client
     from app.services.ws_manager import broadcast_instance_status
-    from app.api.v1.instances import _derive_instance_status
-    from sqlalchemy import select
-    from datetime import datetime, timedelta, timezone
+    import redis.asyncio as aioredis
 
-    SYNC_INTERVAL = 30          # 秒
-    CREATING_TIMEOUT = timedelta(minutes=10)  # 超过 10 分钟仍无 Deployment → error
-
+    redis_url = settings.redis_url
     while True:
-        await asyncio.sleep(SYNC_INTERVAL)
         try:
-            async with AsyncSessionLocal() as session:
-                result = await session.execute(
-                    select(Instance).where(Instance.status.in_(["creating", "starting"]))
-                )
-                pending = result.scalars().all()
-                if not pending:
+            r = aioredis.from_url(redis_url, decode_responses=True)
+            pubsub = r.pubsub()
+            await pubsub.subscribe("lmaicloud:instance_status")
+            logger.info("[Redis PubSub] 已订阅 lmaicloud:instance_status 频道")
+
+            async for message in pubsub.listen():
+                if message["type"] != "message":
                     continue
+                try:
+                    data = json.loads(message["data"])
+                    await broadcast_instance_status(
+                        data["instance_id"],
+                        data["user_id"],
+                        data["status"],
+                    )
+                    logger.debug(
+                        f"[WebSocket广播] 实例 {data['instance_id']}: "
+                        f"{data.get('old_status')} → {data['status']}"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Redis PubSub] 消息处理异常: {e}")
 
-                k8s = get_k8s_client()
-                if not k8s.is_connected:
-                    continue
-
-                # 批量获取所有 Deployment
-                deployments = await asyncio.to_thread(
-                    k8s.list_deployments,
-                    namespace="lmaicloud",
-                    label_selector="app=gpu-instance",
-                )
-                dep_map = {}
-                for dep in deployments:
-                    labels = dep.get("labels") or {}
-                    annotations = dep.get("annotations") or {}
-                    iid = labels.get("instance-id") or annotations.get("lmaicloud/instance-id")
-                    if iid:
-                        dep_map[iid] = dep
-
-                now_utc = datetime.now(timezone.utc)
-
-                for inst in pending:
-                    inst_id = str(inst.id)
-                    dep = dep_map.get(inst_id)
-
-                    if dep:
-                        new_status = _derive_instance_status(dep, db_status=inst.status)
-                    else:
-                        # Deployment 不存在
-                        created = inst.created_at
-                        if created and created.tzinfo is None:
-                            created = created.replace(tzinfo=timezone.utc)
-                        if created and (now_utc - created) > CREATING_TIMEOUT:
-                            new_status = "error"
-                        else:
-                            continue  # 还在创建中，跳过
-
-                    if new_status == inst.status:
-                        continue  # 无变化
-
-                    # 状态发生变化 → 回写 DB
-                    old_status = inst.status
-                    inst.status = new_status
-                    if new_status == "running" and not inst.started_at:
-                        inst.started_at = datetime.utcnow()
-                        # 尝试补充 pod IP
-                        try:
-                            pods = await asyncio.to_thread(
-                                k8s.list_pods,
-                                namespace="lmaicloud",
-                                label_selector=f"instance-id={inst_id}",
-                            )
-                            if pods and pods[0].get("ip"):
-                                inst.internal_ip = pods[0]["ip"]
-                        except Exception:
-                            pass
-
-                    await session.commit()
-                    logger.info(f"[状态同步] 实例 {inst_id}: {old_status} → {new_status}")
-
-                    # WebSocket 广播
-                    try:
-                        await broadcast_instance_status(inst_id, str(inst.user_id), new_status)
-                    except Exception:
-                        pass
-
+        except asyncio.CancelledError:
+            break
         except Exception as e:
-            logger.warning(f"[状态同步] 异常: {e}")
+            logger.warning(f"[Redis PubSub] 连接异常: {e}，5秒后重连")
+            await asyncio.sleep(5)
 
 
 @asynccontextmanager
@@ -131,17 +78,17 @@ async def lifespan(app: FastAPI):
     
     logger.info(f"应用启动完成 - {settings.app_name} v1.0.0")
     
-    # 启动周期性实例状态同步任务
-    sync_task = asyncio.create_task(_periodic_instance_status_sync())
-    logger.info("实例状态周期同步任务已启动 (30s)")
+    # 启动 Redis 订阅，接收 ARQ Worker 状态变更 → WebSocket 广播
+    sub_task = asyncio.create_task(_subscribe_instance_status())
+    logger.info("Redis PubSub 订阅已启动 (lmaicloud:instance_status)")
     
     yield
     
     # Shutdown
     logger.info("应用正在关闭...")
-    sync_task.cancel()
+    sub_task.cancel()
     try:
-        await sync_task
+        await sub_task
     except asyncio.CancelledError:
         pass
     try:
@@ -207,6 +154,7 @@ LMAICloud 提供企业级GPU算力租用服务，支持以下功能：
         {"name": "管理-容器", "description": "管理后台-K8s Pod管理"},
         {"name": "管理-存储", "description": "管理后台-K8s 存储管理"},
         {"name": "工单", "description": "用户工单提交与查看"},
+        {"name": "OpenClaw", "description": "OpenClaw AI Agent 实例管理"},
     ],
 )
 
@@ -229,6 +177,11 @@ app.include_router(billing.router, prefix="/api/v1/billing", tags=["计费"])
 app.include_router(market.router, prefix="/api/v1/market", tags=["市场"])
 app.include_router(tickets.router, prefix="/api/v1/tickets", tags=["工单"])
 app.include_router(system.router, prefix="/api/v1/system", tags=["系统"])
+app.include_router(openclaw.router, prefix="/api/v1/openclaw", tags=["OpenClaw"])
+app.include_router(points.router, prefix="/api/v1/points", tags=["积分"])
+app.include_router(referral.router, prefix="/api/v1/referral", tags=["推广"])
+app.include_router(audit_log.router, prefix="/api/v1/audit-log", tags=["操作日志"])
+app.include_router(notifications.router, prefix="/api/v1/notifications", tags=["通知"])
 
 # Admin routes
 app.include_router(clusters.router, prefix="/api/v1/admin/clusters", tags=["管理-集群"])
@@ -243,6 +196,9 @@ app.include_router(admin_services.router, prefix="/api/v1/admin/services", tags=
 app.include_router(admin_deployments.router, prefix="/api/v1/admin/deployments", tags=["管理-部署"])
 app.include_router(admin_pods.router, prefix="/api/v1/admin/pods", tags=["管理-容器"])
 app.include_router(admin_storage.router, prefix="/api/v1/admin/storage", tags=["管理-存储"])
+app.include_router(admin_openclaw.router, prefix="/api/v1/admin/openclaw", tags=["管理-OpenClaw"])
+app.include_router(admin_dashboard.router, prefix="/api/v1/admin/dashboard", tags=["管理-仪表盘"])
+app.include_router(admin_market.router, prefix="/api/v1/admin/market", tags=["管理-市场"])
 
 # WebSocket routes
 app.include_router(ws.router, tags=["WebSocket"])
