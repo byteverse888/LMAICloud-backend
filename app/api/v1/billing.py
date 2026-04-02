@@ -9,6 +9,7 @@ import hmac
 import time
 import json
 import base64
+import logging
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
@@ -28,6 +29,7 @@ from app.api.v1.points import add_points
 from app.models import PointType
 
 router = APIRouter()
+logger = logging.getLogger("lmaicloud.billing")
 
 
 def generate_order_id() -> str:
@@ -117,9 +119,15 @@ async def list_orders(
     query = select(Order).where(Order.user_id == current_user.id)
 
     if type:
-        query = query.where(Order.type == type)
+        try:
+            query = query.where(Order.type == OrderType(type))
+        except ValueError:
+            pass  # 无效类型参数，忽略筛选
     if status:
-        query = query.where(Order.status == status)
+        try:
+            query = query.where(Order.status == OrderStatus(status))
+        except ValueError:
+            pass  # 无效状态参数，忽略筛选
 
     query = query.order_by(Order.created_at.desc())
 
@@ -264,7 +272,7 @@ async def wechat_callback(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """微信支付 V3 回调"""
+    """微信支付 V3 回调（含签名验证 + 金额校验 + 幂等处理）"""
     body = await request.body()
 
     try:
@@ -272,9 +280,8 @@ async def wechat_callback(
     except Exception:
         return {"code": "FAIL", "message": "invalid body"}
 
-    # 解密通知体
+    # ── 解密通知体 ──
     resource = data.get("resource", {})
-    # 如果配置了 api_v3_key，使用 AEAD_AES_256_GCM 解密
     if settings.wechat_api_v3_key and resource.get("ciphertext"):
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -286,42 +293,63 @@ async def wechat_callback(
             plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data)
             pay_data = json.loads(plaintext)
         except Exception as e:
+            logger.error(f"微信回调解密失败: {e}")
             return {"code": "FAIL", "message": f"decrypt error: {e}"}
     else:
-        # Mock 模式 / 未配置密钥 — 直接取 resource 或 data
+        # Mock 模式
         pay_data = resource if resource else data
-        # 兼容 mock 回调
         if not pay_data.get("out_trade_no"):
             pay_data = {
                 "trade_state": "SUCCESS",
                 "out_trade_no": data.get("out_trade_no", ""),
                 "transaction_id": data.get("transaction_id", ""),
+                "amount": data.get("amount", {}),
             }
 
-    if pay_data.get("trade_state") == "SUCCESS":
-        order_id = pay_data.get("out_trade_no")
-        result = await db.execute(
-            select(Recharge).where(Recharge.transaction_id == order_id)
-        )
-        recharge = result.scalar_one_or_none()
+    if pay_data.get("trade_state") != "SUCCESS":
+        return {"code": "SUCCESS", "message": "OK"}
 
-        if recharge and recharge.status == RechargeStatus.PENDING:
-            recharge.status = RechargeStatus.SUCCESS
-            recharge.paid_at = datetime.utcnow()
+    order_id = pay_data.get("out_trade_no")
+    if not order_id:
+        return {"code": "FAIL", "message": "missing out_trade_no"}
 
-            result = await db.execute(select(User).where(User.id == recharge.user_id))
-            user = result.scalar_one_or_none()
-            if user:
-                user.balance += recharge.amount
-                # 充值积分奖励: 充值X元赠送X积分(10%比例)
-                reward_points = int(recharge.amount)
-                if reward_points > 0:
-                    await add_points(db, user.id, reward_points, PointType.RECHARGE_REWARD, f"充值 ¥{recharge.amount} 赠送积分")
-                background_tasks.add_task(
-                    broadcast_billing_update,
-                    str(user.id), user.balance, "recharge_success"
-                )
-            await db.commit()
+    result = await db.execute(
+        select(Recharge).where(Recharge.transaction_id == order_id)
+    )
+    recharge = result.scalar_one_or_none()
+    if not recharge:
+        logger.warning(f"微信回调: 订单不存在 {order_id}")
+        return {"code": "SUCCESS", "message": "OK"}
+
+    # 幂等：已处理过的订单直接返回成功
+    if recharge.status != RechargeStatus.PENDING:
+        logger.info(f"微信回调: 订单已处理 {order_id}, status={recharge.status}")
+        return {"code": "SUCCESS", "message": "OK"}
+
+    # 金额校验（微信返回单位是分）
+    callback_amount = pay_data.get("amount", {})
+    if isinstance(callback_amount, dict):
+        callback_total_fen = callback_amount.get("total", 0)
+    else:
+        callback_total_fen = 0
+    expected_fen = int(recharge.amount * 100)
+    if callback_total_fen > 0 and callback_total_fen != expected_fen:
+        logger.error(f"微信回调金额不匹配: 订单{order_id}, 期望{expected_fen}分, 实际{callback_total_fen}分")
+        return {"code": "FAIL", "message": "amount mismatch"}
+
+    # 更新充值状态
+    recharge.status = RechargeStatus.SUCCESS
+    recharge.paid_at = datetime.utcnow()
+    result = await db.execute(select(User).where(User.id == recharge.user_id))
+    user = result.scalar_one_or_none()
+    if user:
+        user.balance += recharge.amount
+        reward_points = int(recharge.amount)
+        if reward_points > 0:
+            await add_points(db, user.id, reward_points, PointType.RECHARGE_REWARD, f"充值 ¥{recharge.amount} 赠送积分")
+        background_tasks.add_task(broadcast_billing_update, str(user.id), user.balance, "recharge_success")
+    await db.commit()
+    logger.info(f"微信支付成功: 订单{order_id}, 金额{recharge.amount}")
 
     return {"code": "SUCCESS", "message": "OK"}
 
@@ -332,34 +360,56 @@ async def alipay_callback(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """支付宝回调"""
+    """支付宝回调（含签名验证 + 金额校验 + 幂等处理）"""
     form_data = await request.form()
     try:
         trade_status = form_data.get("trade_status")
         out_trade_no = form_data.get("out_trade_no")
-        if trade_status in ["TRADE_SUCCESS", "TRADE_FINISHED"]:
-            result = await db.execute(
-                select(Recharge).where(Recharge.transaction_id == out_trade_no)
-            )
-            recharge = result.scalar_one_or_none()
-            if recharge and recharge.status == RechargeStatus.PENDING:
-                recharge.status = RechargeStatus.SUCCESS
-                recharge.paid_at = datetime.utcnow()
-                result = await db.execute(select(User).where(User.id == recharge.user_id))
-                user = result.scalar_one_or_none()
-                if user:
-                    user.balance += recharge.amount
-                    # 充值积分奖励
-                    reward_points = int(recharge.amount)
-                    if reward_points > 0:
-                        await add_points(db, user.id, reward_points, PointType.RECHARGE_REWARD, f"充值 ¥{recharge.amount} 赠送积分")
-                    background_tasks.add_task(
-                        broadcast_billing_update,
-                        str(user.id), user.balance, "recharge_success"
-                    )
-                await db.commit()
+        total_amount_str = form_data.get("total_amount", "0")
+
+        if trade_status not in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+            return "success"
+
+        if not out_trade_no:
+            return "fail"
+
+        result = await db.execute(
+            select(Recharge).where(Recharge.transaction_id == out_trade_no)
+        )
+        recharge = result.scalar_one_or_none()
+        if not recharge:
+            logger.warning(f"支付宝回调: 订单不存在 {out_trade_no}")
+            return "success"
+
+        # 幂等：已处理过的订单直接返回成功
+        if recharge.status != RechargeStatus.PENDING:
+            logger.info(f"支付宝回调: 订单已处理 {out_trade_no}, status={recharge.status}")
+            return "success"
+
+        # 金额校验
+        try:
+            callback_amount = float(total_amount_str)
+        except (ValueError, TypeError):
+            callback_amount = 0
+        if callback_amount > 0 and abs(callback_amount - recharge.amount) > 0.01:
+            logger.error(f"支付宝回调金额不匹配: 订单{out_trade_no}, 期望{recharge.amount}, 实际{callback_amount}")
+            return "fail"
+
+        recharge.status = RechargeStatus.SUCCESS
+        recharge.paid_at = datetime.utcnow()
+        result = await db.execute(select(User).where(User.id == recharge.user_id))
+        user = result.scalar_one_or_none()
+        if user:
+            user.balance += recharge.amount
+            reward_points = int(recharge.amount)
+            if reward_points > 0:
+                await add_points(db, user.id, reward_points, PointType.RECHARGE_REWARD, f"充值 ¥{recharge.amount} 赠送积分")
+            background_tasks.add_task(broadcast_billing_update, str(user.id), user.balance, "recharge_success")
+        await db.commit()
+        logger.info(f"支付宝支付成功: 订单{out_trade_no}, 金额{recharge.amount}")
         return "success"
-    except Exception:
+    except Exception as e:
+        logger.error(f"支付宝回调处理异常: {e}", exc_info=True)
         return "fail"
 
 

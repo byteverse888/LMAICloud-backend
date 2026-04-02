@@ -1,22 +1,77 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 import asyncio
 import json
+import traceback
 
 from app.config import settings
 from app.database import init_db
 from app.tasks import get_arq_pool, close_arq_pool
 from app.logging_config import setup_logging, get_logger
-from app.api.v1 import auth, users, instances, storage, images, billing, market, openclaw
+from app.api.v1 import auth, users, instances, storage, images, billing, market, openclaw, public_data
 from app.api.v1 import websocket as ws
 from app.api.v1 import tickets, system, points, referral, audit_log, notifications
 from app.api.v1.admin import clusters, nodes, admin_users, admin_orders, reports, admin_settings, admin_images, admin_tickets
 from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admin_storage
-from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market
+from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market, admin_public_data
 
 # 初始化日志系统
 logger = setup_logging()
+
+
+async def _seed_default_settings():
+    """预置默认系统设置：仅当数据库中不存在时写入默认值"""
+    from app.database import async_session_maker
+    from app.models import SystemSetting
+    from app.api.v1.admin.admin_settings import DEFAULT_SETTINGS
+    from sqlalchemy import select
+
+    try:
+        async with async_session_maker() as db:
+            # 查询已有的 key
+            result = await db.execute(select(SystemSetting.key))
+            existing_keys = {row[0] for row in result.all()}
+
+            count = 0
+            for key, value in DEFAULT_SETTINGS.items():
+                if key not in existing_keys:
+                    db.add(SystemSetting(key=key, value=json.dumps(value)))
+                    count += 1
+
+            if count > 0:
+                await db.commit()
+                logger.info(f"预置 {count} 项默认系统设置")
+            else:
+                logger.info("系统设置已存在，跳过预置")
+    except Exception as e:
+        logger.warning(f"预置默认设置失败: {e}")
+
+
+async def _seed_public_datasets():
+    """预置公开数据集：仅当表为空时写入"""
+    from app.database import async_session_maker
+    from app.models import PublicDataset
+    from app.seed_public_datasets import SEED_PUBLIC_DATASETS
+    from sqlalchemy import select, func
+
+    try:
+        async with async_session_maker() as db:
+            count_result = await db.execute(select(func.count()).select_from(PublicDataset))
+            existing_count = count_result.scalar() or 0
+
+            if existing_count > 0:
+                logger.info(f"公开数据集已有 {existing_count} 条，跳过预置")
+                return
+
+            for item in SEED_PUBLIC_DATASETS:
+                db.add(PublicDataset(**item))
+
+            await db.commit()
+            logger.info(f"预置 {len(SEED_PUBLIC_DATASETS)} 条公开数据集")
+    except Exception as e:
+        logger.warning(f"预置公开数据集失败: {e}")
 
 
 # ── Redis 订阅: 接收 ARQ Worker 的状态变更，转发 WebSocket ──────────
@@ -66,6 +121,10 @@ async def lifespan(app: FastAPI):
     try:
         await init_db()
         logger.info("数据库初始化成功")
+        # 预置默认系统设置（协议、品牌等）
+        await _seed_default_settings()
+        # 预置公开数据集
+        await _seed_public_datasets()
     except Exception as e:
         logger.error(f"数据库初始化失败: {e}")
         logger.warning("运行在无数据库模式")
@@ -163,9 +222,25 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins.split(","),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "Accept"],
 )
+
+
+# ── 全局异常处理中间件 ───────────────────────────────────────
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """捕获所有未处理的异常，返回安全的错误信息"""
+    logger.error(
+        f"未处理异常: {request.method} {request.url.path} - {type(exc).__name__}: {exc}\n"
+        f"{traceback.format_exc()}"
+    )
+    # 生产环境不暴露堆栈信息
+    if settings.app_env in ("development", "dev", "test"):
+        detail = str(exc)
+    else:
+        detail = "服务器内部错误，请稍后重试"
+    return JSONResponse(status_code=500, content={"detail": detail})
 
 # API v1 routes
 app.include_router(auth.router, prefix="/api/v1/auth", tags=["认证"])
@@ -182,6 +257,7 @@ app.include_router(points.router, prefix="/api/v1/points", tags=["积分"])
 app.include_router(referral.router, prefix="/api/v1/referral", tags=["推广"])
 app.include_router(audit_log.router, prefix="/api/v1/audit-log", tags=["操作日志"])
 app.include_router(notifications.router, prefix="/api/v1/notifications", tags=["通知"])
+app.include_router(public_data.router, prefix="/api/v1/public-data", tags=["公开数据"])
 
 # Admin routes
 app.include_router(clusters.router, prefix="/api/v1/admin/clusters", tags=["管理-集群"])
@@ -199,6 +275,7 @@ app.include_router(admin_storage.router, prefix="/api/v1/admin/storage", tags=["
 app.include_router(admin_openclaw.router, prefix="/api/v1/admin/openclaw", tags=["管理-OpenClaw"])
 app.include_router(admin_dashboard.router, prefix="/api/v1/admin/dashboard", tags=["管理-仪表盘"])
 app.include_router(admin_market.router, prefix="/api/v1/admin/market", tags=["管理-市场"])
+app.include_router(admin_public_data.router, prefix="/api/v1/admin/public-data", tags=["管理-公开数据"])
 
 # WebSocket routes
 app.include_router(ws.router, tags=["WebSocket"])
@@ -211,4 +288,32 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """健康检查 - 包含数据库和Redis连接状态"""
+    from app.database import engine
+    import redis.asyncio as aioredis
+
+    checks = {"api": "ok"}
+
+    # 检查数据库
+    try:
+        async with engine.connect() as conn:
+            from sqlalchemy import text
+            await conn.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {type(e).__name__}"
+
+    # 检查Redis
+    try:
+        r = aioredis.from_url(settings.redis_url, socket_timeout=3)
+        await r.ping()
+        await r.aclose()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {type(e).__name__}"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    return {
+        "status": "healthy" if all_ok else "degraded",
+        "checks": checks,
+    }

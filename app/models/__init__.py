@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Float, DateTime, Enum, Boolean, ForeignKey, Integer, Text, BigInteger, UniqueConstraint, Index, text
+from sqlalchemy import Column, String, Float, DateTime, Enum, Boolean, ForeignKey, Integer, Text, BigInteger, UniqueConstraint, Index, text, JSON
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 from app.database import Base
@@ -702,5 +702,24 @@ class MarketProduct(Base):
     tags = Column(Text, nullable=True)  # JSON: ["热门", "推荐"]
     sort_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PublicDataset(Base):
+    """公开数据集表"""
+    __tablename__ = "public_datasets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    category = Column(String(50), nullable=False, default="dataset")  # dataset/model/image/video/audio
+    size = Column(String(50), nullable=True)       # "150GB"
+    downloads = Column(Integer, default=0)
+    description = Column(Text, nullable=True)
+    tags = Column(JSON, default=list)  # ["图像分类","深度学习"]
+    source = Column(String(100), nullable=True)     # "ModelScope"/"HuggingFace"
+    source_url = Column(String(500), nullable=True)
+    is_active = Column(Boolean, default=True)
+    sort_order = Column(Integer, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

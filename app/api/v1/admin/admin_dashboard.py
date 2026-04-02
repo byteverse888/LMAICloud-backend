@@ -7,7 +7,7 @@ from sqlalchemy import select, func
 
 from app.database import get_db
 from app.utils.auth import get_current_admin_user
-from app.models import User as AIUser, Instance, Order, OrderStatus, Recharge, RechargeStatus, AuditLog
+from app.models import User as AIUser, Instance, InstanceStatus, Order, OrderType, OrderStatus, Recharge, RechargeStatus, AuditLog
 from app.services.k8s_client import get_k8s_client
 
 logger = logging.getLogger(__name__)
@@ -30,7 +30,7 @@ async def get_dashboard_stats(
 
     # 运行实例数
     running_instances = (await db.execute(
-        select(func.count(Instance.id)).where(Instance.status == "running")
+        select(func.count(Instance.id)).where(Instance.status == InstanceStatus.RUNNING)
     )).scalar() or 0
 
     total_instances = (await db.execute(select(func.count(Instance.id)))).scalar() or 0
@@ -56,7 +56,7 @@ async def get_dashboard_stats(
     # 今日消费
     today_expense = (await db.execute(
         select(func.coalesce(func.sum(Order.amount), 0))
-        .where(Order.status == OrderStatus.PAID, Order.type != "recharge", Order.created_at >= today_start)
+        .where(Order.status == OrderStatus.PAID, Order.type != OrderType.RECHARGE, Order.created_at >= today_start)
     )).scalar() or 0
 
     # 今日新增用户

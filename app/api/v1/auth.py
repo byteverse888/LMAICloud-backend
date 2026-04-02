@@ -1,12 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, EmailStr
 from typing import Optional
+import re
 import random
 import string
 import secrets
 from datetime import datetime, timedelta
+from collections import defaultdict
 
 from app.database import get_db
 from app.models import User, SystemSetting
@@ -14,7 +16,7 @@ from app.schemas import UserCreate, UserLogin, UserResponse, LoginResponse
 from app.utils.auth import get_password_hash, verify_password, create_access_token, create_refresh_token, decode_token, get_current_user
 from app.logging_config import get_logger
 from app.config import settings
-from app.services.email_service import send_activation_email, get_email_config
+from app.services.email_service import send_activation_email, send_password_reset_email, get_email_config
 from app.api.v1.points import add_points
 from app.models import PointType
 import json
@@ -22,10 +24,103 @@ import json
 router = APIRouter()
 logger = get_logger("lmaicloud.auth")
 
-# 简易验证码存储（生产环境应使用Redis）
+# ── 验证码存储 ────────────────────────────────────────────────
+# 优先使用 Redis，降级使用内存 dict
+_redis_available: Optional[bool] = None
+_redis_client = None
+
+
+async def _get_redis():
+    """惰性获取 Redis 连接"""
+    global _redis_available, _redis_client
+    if _redis_available is False:
+        return None
+    if _redis_client is not None:
+        return _redis_client
+    try:
+        import redis.asyncio as aioredis
+        _redis_client = aioredis.from_url(settings.redis_url, decode_responses=True)
+        await _redis_client.ping()
+        _redis_available = True
+        logger.info("验证码存储: 使用 Redis")
+        return _redis_client
+    except Exception:
+        _redis_available = False
+        logger.warning("验证码存储: Redis 不可用，使用内存模式")
+        return None
+
+
+# 内存降级存储
 verify_codes: dict[str, dict] = {}
-# 图形验证码缓存 {captcha_id: answer}
 captcha_store: dict[str, dict] = {}
+
+
+async def _set_captcha(captcha_id: str, answer: str, ttl: int = 300):
+    """存储验证码（优先Redis，降级内存）"""
+    r = await _get_redis()
+    if r:
+        await r.setex(f"captcha:{captcha_id}", ttl, answer)
+    else:
+        captcha_store[captcha_id] = {
+            'answer': answer,
+            'expires_at': datetime.now() + timedelta(seconds=ttl),
+        }
+
+
+async def _get_and_delete_captcha(captcha_id: str) -> Optional[str]:
+    """获取并删除验证码"""
+    r = await _get_redis()
+    if r:
+        answer = await r.getdel(f"captcha:{captcha_id}")
+        return answer
+    else:
+        stored = captcha_store.pop(captcha_id, None)
+        if stored and datetime.now() < stored['expires_at']:
+            return stored['answer']
+        return None
+
+# ── 登录速率限制 ──────────────────────────────────────────────
+# {ip_or_email: [timestamp, ...]}  —— 滑动窗口
+_login_attempts: dict[str, list[float]] = defaultdict(list)
+LOGIN_RATE_WINDOW = 900     # 15分钟窗口
+LOGIN_MAX_ATTEMPTS_IP = 30  # 同一IP 15分钟内最多30次
+LOGIN_MAX_ATTEMPTS_EMAIL = 10  # 同一邮箱 15分钟内最多10次
+
+
+def _check_login_rate(key: str, max_attempts: int):
+    """检查滑动窗口速率限制"""
+    now = datetime.now().timestamp()
+    attempts = _login_attempts[key]
+    # 清除窗口外的记录
+    _login_attempts[key] = [t for t in attempts if now - t < LOGIN_RATE_WINDOW]
+    if len(_login_attempts[key]) >= max_attempts:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="登录尝试次数过多，请15分钟后再试"
+        )
+    _login_attempts[key].append(now)
+
+
+# ── 密码强度验证 ─────────────────────────────────────────────
+def validate_password_strength(password: str):
+    """
+    密码策略：8-64位，至少包含大写、小写、数字中的两种
+    """
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="密码长度至少8位")
+    if len(password) > 64:
+        raise HTTPException(status_code=400, detail="密码长度不能超过64位")
+    checks = [
+        bool(re.search(r'[A-Z]', password)),
+        bool(re.search(r'[a-z]', password)),
+        bool(re.search(r'[0-9]', password)),
+        bool(re.search(r'[^A-Za-z0-9]', password)),
+    ]
+    if sum(checks) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="密码需包含大写字母、小写字母、数字、特殊字符中的至少两种"
+        )
 
 
 class SendCodeRequest(BaseModel):
@@ -35,6 +130,17 @@ class SendCodeRequest(BaseModel):
 class CodeLoginRequest(BaseModel):
     email: EmailStr
     code: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    """忘记密码请求"""
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    """重置密码请求"""
+    token: str
+    new_password: str
 
 
 class ChangePasswordRequest(BaseModel):
@@ -184,6 +290,9 @@ async def register(
 ):
     """用户注册 - 发送激活邮件"""
     logger.info(f"用户注册请求: {user_data.email}")
+
+    # 密码强度校验
+    validate_password_strength(user_data.password)
     
     # Check if user exists
     result = await db.execute(select(User).where(User.email == user_data.email))
@@ -400,17 +509,8 @@ async def get_captcha(db: AsyncSession = Depends(get_db)):
     chars = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=4))
     captcha_id = secrets.token_urlsafe(16)
     
-    # 存储验证码答案
-    captcha_store[captcha_id] = {
-        'answer': chars,
-        'expires_at': datetime.now() + timedelta(minutes=5),
-    }
-    
-    # 清理过期验证码
-    now = datetime.now()
-    expired_keys = [k for k, v in captcha_store.items() if now > v['expires_at']]
-    for k in expired_keys:
-        captcha_store.pop(k, None)
+    # 存储验证码答案（优先Redis，降级内存）
+    await _set_captcha(captcha_id, chars, ttl=300)
     
     # 生成简单的SVG验证码图片
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="120" height="40">
@@ -431,22 +531,22 @@ async def get_captcha(db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=LoginResponse)
-async def login(user_data: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(user_data: UserLogin, request: Request, db: AsyncSession = Depends(get_db)):
     logger.info(f"用户登录请求: {user_data.email}")
+
+    # 速率限制（IP + 邮箱）
+    client_ip = request.client.host if request.client else "unknown"
+    _check_login_rate(f"ip:{client_ip}", LOGIN_MAX_ATTEMPTS_IP)
+    _check_login_rate(f"email:{user_data.email}", LOGIN_MAX_ATTEMPTS_EMAIL)
     
-    # 检查验证码
+    # 检查验证码（使用 Redis 优先 + 内存降级）
     captcha_enabled = await get_setting_value(db, "captcha_enabled", True)
     if captcha_enabled and user_data.captcha_id:
-        stored = captcha_store.get(user_data.captcha_id)
-        if not stored:
+        stored_answer = await _get_and_delete_captcha(user_data.captcha_id)
+        if not stored_answer:
             raise HTTPException(status_code=400, detail="验证码已过期，请刷新")
-        if datetime.now() > stored['expires_at']:
-            captcha_store.pop(user_data.captcha_id, None)
-            raise HTTPException(status_code=400, detail="验证码已过期，请刷新")
-        if (user_data.captcha_code or "").lower() != stored['answer'].lower():
-            captcha_store.pop(user_data.captcha_id, None)
+        if (user_data.captcha_code or "").lower() != stored_answer.lower():
             raise HTTPException(status_code=400, detail="验证码错误")
-        captcha_store.pop(user_data.captcha_id, None)
     
     result = await db.execute(select(User).where(User.email == user_data.email))
     user = result.scalar_one_or_none()
@@ -519,9 +619,72 @@ async def refresh_token(request: RefreshTokenRequest, db: AsyncSession = Depends
 
 
 @router.post("/forgot-password")
-async def forgot_password(email: str, db: AsyncSession = Depends(get_db)):
-    # TODO: Implement password reset email
-    return {"message": "Password reset email sent"}
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """忘记密码 - 发送密码重置邮件"""
+    logger.info(f"密码重置请求: {request.email}")
+
+    # 无论用户是否存在都返回相同消息，防止邮箱枚举
+    result = await db.execute(select(User).where(User.email == request.email))
+    user = result.scalar_one_or_none()
+
+    if user and user.verified:
+        # 生成重置令牌（复用 activation_token 字段，30分钟有效）
+        reset_token = secrets.token_urlsafe(32)
+        user.activation_token = f"reset:{reset_token}"
+        user.activation_expires_at = datetime.utcnow() + timedelta(minutes=30)
+        await db.commit()
+
+        site_name = await get_setting_value(db, "site_name", "LMAICloud")
+        background_tasks.add_task(
+            send_password_reset_email, db, request.email, reset_token, site_name, 30
+        )
+        logger.info(f"密码重置邮件已发送: {request.email}")
+    else:
+        logger.info(f"密码重置请求-用户不存在或未激活: {request.email}")
+
+    return {"message": "如果该邮箱已注册，重置密码邮件将会发送到您的邮箱"}
+
+
+@router.post("/reset-password")
+async def reset_password(
+    request: ResetPasswordRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """使用重置令牌设置新密码"""
+    logger.info("密码重置执行请求")
+
+    # 密码强度校验
+    validate_password_strength(request.new_password)
+
+    # 查找持有此重置令牌的用户
+    token_value = f"reset:{request.token}"
+    result = await db.execute(
+        select(User).where(User.activation_token == token_value)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        raise HTTPException(status_code=400, detail="无效的重置链接")
+
+    if user.activation_expires_at and datetime.utcnow() > user.activation_expires_at:
+        # 清除过期令牌
+        user.activation_token = None
+        user.activation_expires_at = None
+        await db.commit()
+        raise HTTPException(status_code=400, detail="重置链接已过期，请重新申请")
+
+    # 更新密码并清除令牌
+    user.password_hash = get_password_hash(request.new_password)
+    user.activation_token = None
+    user.activation_expires_at = None
+    await db.commit()
+
+    logger.info(f"密码重置成功: {user.email}")
+    return {"message": "密码重置成功，请使用新密码登录"}
 
 
 @router.post("/change-password")
@@ -539,12 +702,8 @@ async def change_password(
             detail="旧密码错误"
         )
     
-    # 检查新密码长度
-    if len(request.new_password) < 6:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="新密码长度至少6位"
-        )
+    # 密码强度校验
+    validate_password_strength(request.new_password)
     
     # 检查新旧密码是否相同
     if request.old_password == request.new_password:

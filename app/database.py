@@ -7,8 +7,13 @@ from app.config import settings
 
 engine = create_async_engine(
     settings.database_url,
-    echo=settings.debug,
+    echo=settings.debug and settings.app_env == "development",
     future=True,
+    pool_size=20,           # 连接池大小
+    max_overflow=10,        # 超出pool_size时最多额外创建的连接数
+    pool_recycle=1800,      # 连接回收时间(秒)，防止数据库端超时断开
+    pool_pre_ping=True,     # 每次取连接前ping一下，自动剔除失效连接
+    pool_timeout=30,        # 获取连接的超时时间(秒)
 )
 
 async_session_maker = async_sessionmaker(
@@ -101,7 +106,10 @@ async def migrate_enum_values():
 
 
 async def create_default_users():
-    """创建默认用户（若不存在）"""
+    """创建默认用户（仅开发/测试环境）"""
+    if settings.app_env not in ("development", "dev", "test"):
+        return  # 生产环境不自动创建测试账号
+
     import uuid
     import logging
     from app.models import AIUser, UserRole, UserStatus

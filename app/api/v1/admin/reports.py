@@ -6,12 +6,66 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from app.database import get_db
-from app.models import User, Instance, Order, Recharge
+from app.models import User, Instance, Order, Recharge, RechargeStatus, OrderStatus
 from app.utils.auth import get_current_admin_user
 from app.services.k8s_client import get_k8s_client
 
 router = APIRouter()
 
+
+@router.get("/stats")
+async def get_report_stats(
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_admin_user),
+):
+    """获取报表统计数据（前端卡片展示用）"""
+    # 用户统计
+    total_users = (await db.execute(select(func.count(User.id)))).scalar() or 0
+
+    # 运行实例
+    running_instances = (await db.execute(
+        select(func.count(Instance.id)).where(Instance.status == "running")
+    )).scalar() or 0
+
+    # 财务统计
+    total_revenue = (await db.execute(
+        select(func.sum(Recharge.amount)).where(Recharge.status == RechargeStatus.SUCCESS)
+    )).scalar() or 0
+
+    # 今日新增
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_new_users = (await db.execute(
+        select(func.count(User.id)).where(User.created_at >= today_start)
+    )).scalar() or 0
+    today_orders = (await db.execute(
+        select(func.count(Order.id)).where(Order.created_at >= today_start)
+    )).scalar() or 0
+
+    # GPU 使用率
+    gpu_utilization = 0.0
+    try:
+        k8s = get_k8s_client()
+        if k8s.is_connected:
+            k8s_nodes = k8s.list_nodes()
+            total_gpu = 0
+            avail_gpu = 0
+            for kn in k8s_nodes:
+                if kn.get("status") == "Ready" and not kn.get("unschedulable"):
+                    total_gpu += kn.get("gpu_count", 0)
+                    avail_gpu += kn.get("gpu_allocatable", 0)
+            if total_gpu > 0:
+                gpu_utilization = round((total_gpu - avail_gpu) / total_gpu * 100, 1)
+    except Exception:
+        pass
+
+    return {
+        "totalUsers": total_users,
+        "activeInstances": running_instances,
+        "totalRevenue": float(total_revenue),
+        "todayNewUsers": today_new_users,
+        "todayOrders": today_orders,
+        "gpuUtilization": gpu_utilization,
+    }
 
 @router.get("/overview")
 async def get_overview_stats(
@@ -39,10 +93,10 @@ async def get_overview_stats(
     
     # 财务统计
     total_revenue = await db.execute(
-        select(func.sum(Recharge.amount)).where(Recharge.status == "completed")
+        select(func.sum(Recharge.amount)).where(Recharge.status == RechargeStatus.SUCCESS)
     )
     total_consumption = await db.execute(
-        select(func.sum(Order.amount)).where(Order.status == "completed")
+        select(func.sum(Order.amount)).where(Order.status == OrderStatus.PAID)
     )
     
     return {
@@ -103,7 +157,7 @@ async def get_revenue_trend(
             func.sum(Recharge.amount).label("amount"),
         )
         .where(
-            Recharge.status == "completed",
+            Recharge.status == RechargeStatus.SUCCESS,
             Recharge.created_at >= start_date,
         )
         .group_by(func.date(Recharge.created_at))
@@ -132,7 +186,7 @@ async def get_consumption_trend(
             func.sum(Order.amount).label("amount"),
         )
         .where(
-            Order.status == "completed",
+            Order.status == OrderStatus.PAID,
             Order.created_at >= start_date,
         )
         .group_by(func.date(Order.created_at))
@@ -237,7 +291,7 @@ async def get_top_users(
         )
         .join(Order, Order.user_id == User.id)
         .where(
-            Order.status == "completed",
+            Order.status == OrderStatus.PAID,
             Order.created_at >= start_date,
         )
         .group_by(User.id, User.email, User.nickname)

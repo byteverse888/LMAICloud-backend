@@ -82,7 +82,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
     - monthly/yearly: 到期后自动续费或停机
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus
+    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus, InstanceStatus
     from sqlalchemy import select
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
@@ -107,7 +107,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         else:
             result = await session.execute(select(Instance).where(Instance.id == instance_id))
             instance = result.scalar_one_or_none()
-            if not instance or instance.status != "running":
+            if not instance or instance.status != InstanceStatus.RUNNING:
                 return {"status": "skipped", "reason": "instance not running"}
             hourly_price = instance.hourly_price
             billing_cycle = getattr(instance, "billing_cycle", None) or instance.billing_type or "hourly"
@@ -137,7 +137,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
 
             if user.balance < renew_price:
                 # 余额不足，停机
-                instance.status = "expired"
+                instance.status = InstanceStatus.EXPIRED
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low for renewal"}
 
@@ -171,7 +171,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         if user.balance < hourly_price:
             print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {hourly_price}")
             if user.balance < -10:
-                instance.status = "expired"
+                instance.status = InstanceStatus.EXPIRED
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low"}
 
@@ -204,6 +204,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
     """
     from app.database import AsyncSessionLocal
     from app.models import Instance, OpenClawInstance
+    from app.models import InstanceStatus as _IS
     from sqlalchemy import select
 
     print(f"[BILLING] Processing all instance billing...")
@@ -214,7 +215,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
     async with AsyncSessionLocal() as session:
         # GPU 实例
         result = await session.execute(
-            select(Instance).where(Instance.status == "running")
+            select(Instance).where(Instance.status == _IS.RUNNING)
         )
         for instance in result.scalars().all():
             try:
@@ -279,6 +280,7 @@ async def sync_instance_status_task(ctx: dict) -> dict:
     """
     from app.database import AsyncSessionLocal
     from app.models import Instance
+    from app.models import InstanceStatus as _IS
     from app.services.k8s_client import get_k8s_client
     from app.api.v1.instances import _derive_instance_status
     from sqlalchemy import select
@@ -290,7 +292,7 @@ async def sync_instance_status_task(ctx: dict) -> dict:
     try:
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(Instance).where(Instance.status.in_(["creating", "starting"]))
+                select(Instance).where(Instance.status.in_([_IS.CREATING, _IS.STARTING]))
             )
             pending = result.scalars().all()
             if not pending:
@@ -327,7 +329,7 @@ async def sync_instance_status_task(ctx: dict) -> dict:
                     if created and created.tzinfo is None:
                         created = created.replace(tzinfo=timezone.utc)
                     if created and (now_utc - created) > CREATING_TIMEOUT:
-                        new_status = "error"
+                        new_status = _IS.ERROR
                     else:
                         continue
 
@@ -336,7 +338,7 @@ async def sync_instance_status_task(ctx: dict) -> dict:
 
                 old_status = inst.status
                 inst.status = new_status
-                if new_status == "running" and not inst.started_at:
+                if new_status == _IS.RUNNING and not inst.started_at:
                     inst.started_at = datetime.utcnow()
                     try:
                         inst_ns = inst.namespace or "lmaicloud"

@@ -311,6 +311,92 @@ async def send_activation_email(
     return success
 
 
+def generate_password_reset_email_html(
+    activation_link: str,
+    site_name: str = "LMAICloud",
+    expire_minutes: int = 30
+) -> tuple[str, str]:
+    """生成密码重置邮件的HTML和纯文本内容"""
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0;padding:0;font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background-color:#f5f5f5;">
+<div style="max-width:600px;margin:0 auto;padding:40px 20px;">
+ <div style="background:#fff;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,.1);overflow:hidden;">
+  <div style="background:linear-gradient(135deg,#ef4444 0%,#f97316 100%);padding:30px;text-align:center;">
+   <h1 style="color:#fff;margin:0;font-size:28px;">{site_name}</h1>
+   <p style="color:rgba(255,255,255,.9);margin:10px 0 0;font-size:14px;">密码重置</p>
+  </div>
+  <div style="padding:40px 30px;">
+   <h2 style="color:#1f2937;margin:0 0 20px;font-size:22px;">重置您的密码</h2>
+   <p style="color:#4b5563;line-height:1.6;margin:0 0 20px;">
+    您好，我们收到了您的密码重置请求。请点击下方按钮设置新密码：
+   </p>
+   <div style="text-align:center;margin:30px 0;">
+    <a href="{activation_link}"
+       style="display:inline-block;background:linear-gradient(135deg,#ef4444 0%,#f97316 100%);
+              color:#fff;text-decoration:none;padding:14px 40px;border-radius:8px;
+              font-size:16px;font-weight:600;box-shadow:0 4px 12px rgba(239,68,68,.3);">
+      重置密码
+    </a>
+   </div>
+   <p style="color:#6b7280;font-size:14px;line-height:1.6;margin:20px 0;">
+    如果按钮无法点击，请复制以下链接到浏览器打开：
+   </p>
+   <p style="color:#ef4444;font-size:13px;word-break:break-all;background:#f3f4f6;padding:12px;border-radius:6px;margin:0 0 20px;">
+    {activation_link}
+   </p>
+   <div style="border-top:1px solid #e5e7eb;padding-top:20px;margin-top:30px;">
+    <p style="color:#9ca3af;font-size:13px;margin:0;">⏰ 此链接将在 {expire_minutes} 分钟后失效</p>
+    <p style="color:#9ca3af;font-size:13px;margin:10px 0 0;">🔒 如果您没有请求重置密码，请忽略此邮件，您的账户仍然安全</p>
+   </div>
+  </div>
+  <div style="background:#f9fafb;padding:20px 30px;text-align:center;">
+   <p style="color:#9ca3af;font-size:12px;margin:0;">© 2025 {site_name}. All rights reserved.</p>
+  </div>
+ </div>
+</div>
+</body>
+</html>
+"""
+    text_content = f"""重置您的密码
+
+您好，我们收到了您的密码重置请求。请点击以下链接设置新密码：
+
+{activation_link}
+
+此链接将在 {expire_minutes} 分钟后失效。
+
+如果您没有请求重置密码，请忽略此邮件。
+
+© 2025 {site_name}
+"""
+    return html_content, text_content
+
+
+async def send_password_reset_email(
+    db: AsyncSession,
+    to_email: str,
+    reset_token: str,
+    site_name: str = "LMAICloud",
+    expire_minutes: int = 30
+) -> bool:
+    """发送密码重置邮件"""
+    config = await get_email_config(db)
+    frontend_url = settings.frontend_url.rstrip('/')
+    reset_link = f"{frontend_url}/forgot-password?token={reset_token}"
+    html_content, text_content = generate_password_reset_email_html(
+        activation_link=reset_link, site_name=site_name, expire_minutes=expire_minutes
+    )
+    success, _ = send_email_sync(
+        config=config, to_email=to_email,
+        subject=f"【{site_name}】密码重置",
+        html_content=html_content, text_content=text_content
+    )
+    return success
+
+
 async def send_test_email(db: AsyncSession, to_email: str) -> tuple[bool, Optional[str]]:
     """发送测试邮件，返回 (成功, 错误信息)"""
     config = await get_email_config(db)

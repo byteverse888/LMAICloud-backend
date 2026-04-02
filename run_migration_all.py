@@ -191,8 +191,8 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                name VARCHAR(100) NOT NULL,
                description TEXT,
-               plan_type VARCHAR(20) NOT NULL DEFAULT 'package',
-               billing_cycle VARCHAR(20) NOT NULL DEFAULT 'monthly',
+               plan_type VARCHAR(20) NOT NULL DEFAULT 'PACKAGE',
+               billing_cycle VARCHAR(20) NOT NULL DEFAULT 'MONTHLY',
                cpu_cores INTEGER NOT NULL DEFAULT 0,
                memory_gb INTEGER NOT NULL DEFAULT 0,
                gpu_count INTEGER NOT NULL DEFAULT 0,
@@ -349,173 +349,185 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     # ── 8. 预置种子数据 ──────────────────────────────────────
     ("8. 预置资源套餐 (resource_plans)", [
         """INSERT INTO resource_plans (id, name, description, plan_type, billing_cycle,
-               cpu_cores, memory_gb, gpu_count, gpu_model, disk_gb, price, original_price, is_active, sort_order)
+               cpu_cores, memory_gb, gpu_count, gpu_model, disk_gb, price, original_price, is_active, sort_order,
+               created_at, updated_at)
            VALUES
                (gen_random_uuid(), '入门GPU', 'RTX 3090 入门算力，适合模型微调和小规模推理',
-                'package', 'hourly', 8, 16, 1, 'RTX 3090', 50, 2.0, 2.5, true, 10),
+                'PACKAGE', 'HOURLY', 8, 16, 1, 'RTX 3090', 50, 2.0, 2.5, true, 10, NOW(), NOW()),
 
                (gen_random_uuid(), '标准GPU', 'RTX 4090 标准算力，适合中等规模训练和推理',
-                'package', 'hourly', 16, 32, 1, 'RTX 4090', 100, 3.5, 4.5, true, 20),
+                'PACKAGE', 'HOURLY', 16, 32, 1, 'RTX 4090', 100, 3.5, 4.5, true, 20, NOW(), NOW()),
 
                (gen_random_uuid(), '专业GPU', 'A100 40G 专业算力，适合大模型训练',
-                'package', 'hourly', 32, 64, 1, 'A100 40G', 200, 12.0, 15.0, true, 30),
+                'PACKAGE', 'HOURLY', 32, 64, 1, 'A100 40G', 200, 12.0, 15.0, true, 30, NOW(), NOW()),
 
                (gen_random_uuid(), '旗舰GPU', 'A100 80G 旗舰算力，适合大规模分布式训练',
-                'package', 'hourly', 64, 128, 1, 'A100 80G', 500, 18.0, 22.0, true, 40),
+                'PACKAGE', 'HOURLY', 64, 128, 1, 'A100 80G', 500, 18.0, 22.0, true, 40, NOW(), NOW()),
 
                (gen_random_uuid(), '顶配GPU', 'H100 80G 顶级算力，适合超大模型和高性能计算',
-                'package', 'hourly', 64, 256, 1, 'H100 80G', 500, 25.0, 30.0, true, 50),
+                'PACKAGE', 'HOURLY', 64, 256, 1, 'H100 80G', 500, 25.0, 30.0, true, 50, NOW(), NOW()),
 
                (gen_random_uuid(), '入门月卡', 'RTX 3090 包月套餐，性价比之选',
-                'package', 'monthly', 8, 16, 1, 'RTX 3090', 50, 999.0, 1440.0, true, 60),
+                'PACKAGE', 'MONTHLY', 8, 16, 1, 'RTX 3090', 50, 999.0, 1440.0, true, 60, NOW(), NOW()),
 
                (gen_random_uuid(), '标准月卡', 'RTX 4090 包月套餐，稳定高效',
-                'package', 'monthly', 16, 32, 1, 'RTX 4090', 100, 1799.0, 2520.0, true, 70),
+                'PACKAGE', 'MONTHLY', 16, 32, 1, 'RTX 4090', 100, 1799.0, 2520.0, true, 70, NOW(), NOW()),
 
                (gen_random_uuid(), '专业月卡', 'A100 40G 包月套餐，专业训练首选',
-                'package', 'monthly', 32, 64, 1, 'A100 40G', 200, 6999.0, 8640.0, true, 80)
+                'PACKAGE', 'MONTHLY', 32, 64, 1, 'A100 40G', 200, 6999.0, 8640.0, true, 80, NOW(), NOW())
            ON CONFLICT DO NOTHING""",
     ]),
 
     ("8. 预置算力市场产品 (market_products)", [
-        """INSERT INTO market_products (id, category, name, description, specs, price, price_unit, tags, sort_order, is_active)
+        """INSERT INTO market_products (id, category, name, description, specs, price, price_unit, tags, sort_order, is_active,
+               created_at, updated_at)
            VALUES
-               (gen_random_uuid(), 'compute', 'RTX 3090 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'RTX 3090 云主机',
                 '24GB显存，适合模型微调、推理部署和AI开发',
                 '{"gpu": "RTX 3090", "gpu_memory": "24GB", "cpu": "8核", "memory": "16GB", "disk": "50GB SSD", "bandwidth": "100Mbps"}',
                 2.0, '元/小时',
-                '["入门", "性价比"]', 10, true),
+                '["入门", "性价比"]', 10, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'compute', 'RTX 4090 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'RTX 4090 云主机',
                 '24GB显存，Ada Lovelace架构，适合中等规模AI训练和推理',
                 '{"gpu": "RTX 4090", "gpu_memory": "24GB", "cpu": "16核", "memory": "32GB", "disk": "100GB SSD", "bandwidth": "200Mbps"}',
                 3.5, '元/小时',
-                '["热门", "推荐"]', 20, true),
+                '["热门", "推荐"]', 20, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'compute', 'A100 40G 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'A100 40G 云主机',
                 '40GB HBM2e显存，专业级AI训练卡，支持NVLink',
                 '{"gpu": "A100 40G", "gpu_memory": "40GB", "cpu": "32核", "memory": "64GB", "disk": "200GB SSD", "bandwidth": "500Mbps"}',
                 12.0, '元/小时',
-                '["专业", "训练"]', 30, true),
+                '["专业", "训练"]', 30, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'compute', 'A100 80G 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'A100 80G 云主机',
                 '80GB HBM2e显存，大模型训练首选，支持NVLink互联',
                 '{"gpu": "A100 80G", "gpu_memory": "80GB", "cpu": "64核", "memory": "128GB", "disk": "500GB SSD", "bandwidth": "1Gbps"}',
                 18.0, '元/小时',
-                '["旗舰", "大模型"]', 40, true),
+                '["旗舰", "大模型"]', 40, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'compute', 'H100 80G 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'H100 80G 云主机',
                 '80GB HBM3显存，Hopper架构，全球顶级AI计算卡',
                 '{"gpu": "H100 80G", "gpu_memory": "80GB", "cpu": "64核", "memory": "256GB", "disk": "500GB NVMe", "bandwidth": "1Gbps"}',
                 25.0, '元/小时',
-                '["顶配", "旗舰"]', 50, true),
+                '["顶配", "旗舰"]', 50, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'compute', 'V100 32G 云主机',
+               (gen_random_uuid(), 'COMPUTE', 'V100 32G 云主机',
                 '32GB HBM2显存，经典深度学习卡，稳定可靠',
                 '{"gpu": "V100 32G", "gpu_memory": "32GB", "cpu": "16核", "memory": "64GB", "disk": "100GB SSD", "bandwidth": "200Mbps"}',
                 8.0, '元/小时',
-                '["经典", "稳定"]', 60, true)
+                '["经典", "稳定"]', 60, true, NOW(), NOW())
            ON CONFLICT DO NOTHING""",
     ]),
 
     ("8. 预置AI应用产品 (market_products)", [
-        """INSERT INTO market_products (id, category, name, description, specs, price, price_unit, tags, sort_order, is_active)
+        """INSERT INTO market_products (id, category, name, description, specs, price, price_unit, tags, sort_order, is_active,
+               created_at, updated_at)
            VALUES
-               (gen_random_uuid(), 'ai_app', 'ChatGLM3 智能对话',
+               (gen_random_uuid(), 'AI_APP', 'ChatGLM3 智能对话',
                 '清华开源大语言模型，支持中英双语对话、代码生成、数学推理',
                 '{"model": "ChatGLM3-6B", "parameters": "6B", "gpu_memory": "13GB", "min_gpu": "RTX 3090"}',
                 0, '元/次',
-                '["热门", "中文"]', 10, true),
+                '["热门", "中文"]', 10, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'ai_app', 'Stable Diffusion XL',
+               (gen_random_uuid(), 'AI_APP', 'Stable Diffusion XL',
                 '高质量文生图模型，支持多种风格和LoRA扩展',
                 '{"model": "SDXL 1.0", "parameters": "3.5B", "gpu_memory": "8GB", "min_gpu": "RTX 3090"}',
                 0, '元/张',
-                '["热门", "绘画"]', 20, true),
+                '["热门", "绘画"]', 20, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'ai_app', 'Whisper 语音识别',
+               (gen_random_uuid(), 'AI_APP', 'Whisper 语音识别',
                 'OpenAI Whisper 大规模语音识别模型，支持99种语言',
                 '{"model": "Whisper Large-V3", "parameters": "1.5B", "gpu_memory": "10GB", "min_gpu": "RTX 3090"}',
                 0, '元/分钟',
-                '["语音", "多语言"]', 30, true),
+                '["语音", "多语言"]', 30, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'ai_app', 'LLaMA 3 开源大模型',
+               (gen_random_uuid(), 'AI_APP', 'LLaMA 3 开源大模型',
                 'Meta LLaMA 3 开源大语言模型，强大的通用对话能力',
                 '{"model": "LLaMA-3-8B", "parameters": "8B", "gpu_memory": "16GB", "min_gpu": "RTX 4090"}',
                 0, '元/次',
-                '["开源", "通用"]', 40, true),
+                '["开源", "通用"]', 40, true, NOW(), NOW()),
 
-               (gen_random_uuid(), 'ai_app', 'ComfyUI 工作流',
+               (gen_random_uuid(), 'AI_APP', 'ComfyUI 工作流',
                 '基于节点的AI图片工作流，支持自定义模型组合与批量处理',
                 '{"model": "ComfyUI", "parameters": "N/A", "gpu_memory": "8GB", "min_gpu": "RTX 3090"}',
                 0, '元/小时',
-                '["绘画", "工作流"]', 50, true)
+                '["绘画", "工作流"]', 50, true, NOW(), NOW())
            ON CONFLICT DO NOTHING""",
     ]),
 
     ("8. 预置应用镜像 (app_images)", [
-        """INSERT INTO app_images (id, name, tag, category, description, image_url, size_gb, is_public, sort_order, status)
+        """INSERT INTO app_images (id, name, tag, category, description, image_url, size_gb, is_public, sort_order, status,
+               created_at, updated_at)
            VALUES
                (gen_random_uuid(), 'Ubuntu 22.04', 'cuda12.2',
                 'base', 'Ubuntu 22.04 + CUDA 12.2 + Python 3.10 基础环境',
-                'nvcr.io/nvidia/cuda:12.2.0-devel-ubuntu22.04', 8.5, true, 10, 'active'),
+                'nvcr.io/nvidia/cuda:12.2.0-devel-ubuntu22.04', 8.5, true, 10, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'Ubuntu 22.04', 'cuda11.8',
                 'base', 'Ubuntu 22.04 + CUDA 11.8 + Python 3.10 基础环境',
-                'nvcr.io/nvidia/cuda:11.8.0-devel-ubuntu22.04', 7.8, true, 20, 'active'),
+                'nvcr.io/nvidia/cuda:11.8.0-devel-ubuntu22.04', 7.8, true, 20, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'PyTorch 2.2', 'cuda12.1-py310',
                 'framework', 'PyTorch 2.2 + CUDA 12.1 + Python 3.10，含 torchvision 和 torchaudio',
-                'nvcr.io/nvidia/pytorch:24.01-py3', 15.0, true, 30, 'active'),
+                'nvcr.io/nvidia/pytorch:24.01-py3', 15.0, true, 30, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'PyTorch 2.1', 'cuda11.8-py310',
                 'framework', 'PyTorch 2.1 + CUDA 11.8 + Python 3.10，广泛兼容',
-                'nvcr.io/nvidia/pytorch:23.10-py3', 14.2, true, 40, 'active'),
+                'nvcr.io/nvidia/pytorch:23.10-py3', 14.2, true, 40, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'TensorFlow 2.15', 'cuda12.2-py310',
                 'framework', 'TensorFlow 2.15 + CUDA 12.2 + Python 3.10',
-                'nvcr.io/nvidia/tensorflow:24.01-tf2-py3', 14.8, true, 50, 'active'),
+                'nvcr.io/nvidia/tensorflow:24.01-tf2-py3', 14.8, true, 50, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'Jupyter Lab', 'cuda12.1-py310',
                 'tool', 'Jupyter Lab + CUDA 12.1 + 常用数据科学工具包',
-                'nvcr.io/nvidia/pytorch:24.01-py3', 15.0, true, 60, 'active'),
+                'nvcr.io/nvidia/pytorch:24.01-py3', 15.0, true, 60, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'ComfyUI', 'latest',
                 'model', 'ComfyUI AI绘画工作流 + 预装 SDXL 基础模型',
-                'registry.cn-hangzhou.aliyuncs.com/lmaicloud/comfyui:latest', 20.0, true, 70, 'active'),
+                'registry.cn-hangzhou.aliyuncs.com/lmaicloud/comfyui:latest', 20.0, true, 70, 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'ChatGLM3', '6b-int4',
                 'model', 'ChatGLM3-6B 量化版，低显存可用，支持中英双语对话',
-                'registry.cn-hangzhou.aliyuncs.com/lmaicloud/chatglm3:6b-int4', 12.0, true, 80, 'active')
+                'registry.cn-hangzhou.aliyuncs.com/lmaicloud/chatglm3:6b-int4', 12.0, true, 80, 'ACTIVE', NOW(), NOW())
            ON CONFLICT DO NOTHING""",
     ]),
 
+    ("8. 补齐种子数据时间戳", [
+        "UPDATE resource_plans SET created_at = NOW(), updated_at = NOW() WHERE created_at IS NULL",
+        "UPDATE market_products SET created_at = NOW(), updated_at = NOW() WHERE created_at IS NULL",
+        "UPDATE app_images SET created_at = NOW(), updated_at = NOW() WHERE created_at IS NULL",
+        "UPDATE images SET created_at = NOW(), updated_at = NOW() WHERE created_at IS NULL",
+    ]),
+
     ("8. 预置容器镜像 (images)", [
-        """INSERT INTO images (id, name, version, type, size, description, is_public, author, tags, status)
+        """INSERT INTO images (id, name, version, type, size, description, is_public, author, tags, status,
+               created_at, updated_at)
            VALUES
                (gen_random_uuid(), 'Ubuntu CUDA', '12.2-22.04',
-                'official', 8.5, 'Ubuntu 22.04 + CUDA 12.2 官方基础镜像', true, 'NVIDIA',
-                '["CUDA", "Ubuntu", "基础"]', 'active'),
+                'OFFICIAL', 8.5, 'Ubuntu 22.04 + CUDA 12.2 官方基础镜像', true, 'NVIDIA',
+                '["CUDA", "Ubuntu", "基础"]', 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'Ubuntu CUDA', '11.8-22.04',
-                'official', 7.8, 'Ubuntu 22.04 + CUDA 11.8 官方基础镜像', true, 'NVIDIA',
-                '["CUDA", "Ubuntu", "基础"]', 'active'),
+                'OFFICIAL', 7.8, 'Ubuntu 22.04 + CUDA 11.8 官方基础镜像', true, 'NVIDIA',
+                '["CUDA", "Ubuntu", "基础"]', 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'PyTorch', '2.2-cu121',
-                'official', 15.0, 'PyTorch 2.2 + CUDA 12.1 官方训练镜像', true, 'NVIDIA',
-                '["PyTorch", "深度学习", "训练"]', 'active'),
+                'OFFICIAL', 15.0, 'PyTorch 2.2 + CUDA 12.1 官方训练镜像', true, 'NVIDIA',
+                '["PyTorch", "深度学习", "训练"]', 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'PyTorch', '2.1-cu118',
-                'official', 14.2, 'PyTorch 2.1 + CUDA 11.8 官方训练镜像', true, 'NVIDIA',
-                '["PyTorch", "深度学习", "兼容"]', 'active'),
+                'OFFICIAL', 14.2, 'PyTorch 2.1 + CUDA 11.8 官方训练镜像', true, 'NVIDIA',
+                '["PyTorch", "深度学习", "兼容"]', 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'TensorFlow', '2.15-cu122',
-                'official', 14.8, 'TensorFlow 2.15 + CUDA 12.2 官方训练镜像', true, 'NVIDIA',
-                '["TensorFlow", "深度学习"]', 'active'),
+                'OFFICIAL', 14.8, 'TensorFlow 2.15 + CUDA 12.2 官方训练镜像', true, 'NVIDIA',
+                '["TensorFlow", "深度学习"]', 'ACTIVE', NOW(), NOW()),
 
                (gen_random_uuid(), 'Jupyter Lab', 'cu121-py310',
-                'official', 15.0, 'Jupyter Lab 交互开发环境，含常用科学计算包', true, 'LMAICloud',
-                '["Jupyter", "开发工具", "交互式"]', 'active')
+                'OFFICIAL', 15.0, 'Jupyter Lab 交互开发环境，含常用科学计算包', true, 'LMAICloud',
+                '["Jupyter", "开发工具", "交互式"]', 'ACTIVE', NOW(), NOW())
            ON CONFLICT DO NOTHING""",
     ]),
 ]

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from uuid import UUID
 
 from app.database import get_db
-from app.models import Order, User, Recharge, RechargeStatus, ResourcePlan
+from app.models import Order, OrderStatus, User, Recharge, RechargeStatus, ResourcePlan
 from app.schemas import (
     OrderResponse, RechargeResponse,
     ResourcePlanCreate, ResourcePlanUpdate, ResourcePlanResponse,
@@ -18,6 +18,102 @@ from app.schemas import (
 from app.utils.auth import get_current_admin_user
 
 router = APIRouter()
+
+
+# ==================== 统一订单列表 ====================
+
+@router.get("")
+async def list_all_orders(
+    page: int = 1,
+    size: int = 20,
+    user_id: Optional[UUID] = None,
+    user_email: Optional[str] = None,
+    status: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_admin_user),
+):
+    """获取所有订单列表（合并消费+充值）"""
+    # 找到目标用户
+    target_user_ids = None
+    if user_email:
+        res = await db.execute(select(User.id).where(User.email.ilike(f"%{user_email}%")))
+        target_user_ids = [r[0] for r in res.all()]
+        if not target_user_ids:
+            return {"list": [], "total": 0, "page": page, "size": size}
+
+    all_orders = []
+
+    # 消费订单
+    oq = select(Order)
+    if user_id:
+        oq = oq.where(Order.user_id == user_id)
+    if target_user_ids:
+        oq = oq.where(Order.user_id.in_(target_user_ids))
+    if status and status != "all":
+        oq = oq.where(Order.status == status)
+    orders = (await db.execute(oq.order_by(Order.created_at.desc()))).scalars().all()
+
+    for o in orders:
+        # 查询用户邮箱
+        user_res = await db.execute(select(User.email).where(User.id == o.user_id))
+        email = user_res.scalar() or ""
+        o_type = o.type.value if hasattr(o.type, 'value') else str(o.type or 'consumption')
+        o_status = o.status.value if hasattr(o.status, 'value') else str(o.status or 'pending')
+        all_orders.append({
+            "id": str(o.id),
+            "user_id": str(o.user_id),
+            "user_email": email,
+            "type": o_type,
+            "product_name": o.product_name or o.description or "",
+            "description": o.description or "",
+            "amount": float(o.amount or 0),
+            "status": o_status,
+            "created_at": o.created_at.isoformat() if o.created_at else "",
+        })
+
+    # 充值订单
+    rq = select(Recharge)
+    if user_id:
+        rq = rq.where(Recharge.user_id == user_id)
+    if target_user_ids:
+        rq = rq.where(Recharge.user_id.in_(target_user_ids))
+    if status and status != "all":
+        # 将前端统一状态映射到 RechargeStatus
+        recharge_status_map = {"paid": RechargeStatus.SUCCESS, "pending": RechargeStatus.PENDING, "failed": RechargeStatus.FAILED}
+        mapped = recharge_status_map.get(status)
+        if mapped:
+            rq = rq.where(Recharge.status == mapped)
+        else:
+            rq = rq.where(Recharge.status == status)
+    recharges = (await db.execute(rq.order_by(Recharge.created_at.desc()))).scalars().all()
+
+    for r in recharges:
+        user_res = await db.execute(select(User.email).where(User.id == r.user_id))
+        email = user_res.scalar() or ""
+        # 将 RechargeStatus 归一化为 OrderStatus 值（success→paid, failed→cancelled）
+        raw_status = r.status.value if hasattr(r.status, 'value') else str(r.status)
+        status_map = {"success": "paid", "failed": "cancelled"}
+        normalized_status = status_map.get(raw_status, raw_status)
+        payment = r.payment_method.value if hasattr(r.payment_method, 'value') else str(r.payment_method or '')
+        all_orders.append({
+            "id": str(r.id),
+            "user_id": str(r.user_id),
+            "user_email": email,
+            "type": "recharge",
+            "product_name": f"{payment}充值",
+            "description": f"{payment}充值",
+            "amount": float(r.amount or 0),
+            "status": normalized_status,
+            "created_at": r.created_at.isoformat() if r.created_at else "",
+        })
+
+    # 按时间排序
+    all_orders.sort(key=lambda x: x["created_at"], reverse=True)
+    total = len(all_orders)
+    start = (page - 1) * size
+    end_idx = start + size
+
+    return {"list": all_orders[start:end_idx], "total": total, "page": page, "size": size}
 
 
 # ==================== 消费订单 ====================
@@ -119,7 +215,7 @@ async def get_order_stats(
 
     # 消费总额
     cq = select(func.sum(Order.amount)).where(
-        Order.status == "completed", Order.created_at >= start_date
+        Order.status == OrderStatus.PAID, Order.created_at >= start_date
     )
     if user_id:
         cq = cq.where(Order.user_id == user_id)
@@ -127,7 +223,7 @@ async def get_order_stats(
 
     # 充值总额
     rq = select(func.sum(Recharge.amount)).where(
-        Recharge.status == "completed", Recharge.created_at >= start_date
+        Recharge.status == RechargeStatus.SUCCESS, Recharge.created_at >= start_date
     )
     if user_id:
         rq = rq.where(Recharge.user_id == user_id)
@@ -186,14 +282,16 @@ async def list_admin_transactions(
             oq = oq.where(Order.user_id.in_(target_user_ids))
         orders = (await db.execute(oq)).scalars().all()
         for o in orders:
+            o_type = o.type.value if hasattr(o.type, 'value') else str(o.type or 'consumption')
+            o_status = o.status.value if hasattr(o.status, 'value') else str(o.status or 'pending')
             transactions.append({
                 "id": str(o.id),
                 "user_id": str(o.user_id),
                 "type": "consumption",
                 "amount": -abs(o.amount),
-                "status": o.status,
+                "status": o_status,
                 "created_at": o.created_at.isoformat(),
-                "description": o.description or o.product_name or f"{o.type}订单",
+                "description": o.description or o.product_name or f"{o_type}订单",
             })
 
     # 充值
@@ -205,14 +303,15 @@ async def list_admin_transactions(
             rq = rq.where(Recharge.user_id.in_(target_user_ids))
         recharges = (await db.execute(rq)).scalars().all()
         for r in recharges:
+            payment = r.payment_method.value if hasattr(r.payment_method, 'value') else str(r.payment_method or '')
             transactions.append({
                 "id": str(r.id),
                 "user_id": str(r.user_id),
                 "type": "recharge",
                 "amount": r.amount,
-                "status": "success",
+                "status": "paid",
                 "created_at": r.created_at.isoformat(),
-                "description": f"{r.payment_method}充值",
+                "description": f"{payment}充值",
             })
 
     transactions.sort(key=lambda x: x["created_at"], reverse=True)
@@ -318,10 +417,10 @@ async def confirm_recharge_order(
     recharge = result.scalar_one_or_none()
     if not recharge:
         raise HTTPException(status_code=404, detail="充值订单不存在")
-    if recharge.status != "pending":
+    if recharge.status != RechargeStatus.PENDING:
         raise HTTPException(status_code=400, detail="订单状态不允许确认")
 
-    recharge.status = "completed"
+    recharge.status = RechargeStatus.SUCCESS
     recharge.paid_at = datetime.utcnow()
 
     user_result = await db.execute(select(User).where(User.id == recharge.user_id))
@@ -345,10 +444,10 @@ async def cancel_recharge_order(
     recharge = result.scalar_one_or_none()
     if not recharge:
         raise HTTPException(status_code=404, detail="充值订单不存在")
-    if recharge.status not in ["pending"]:
+    if recharge.status not in [RechargeStatus.PENDING]:
         raise HTTPException(status_code=400, detail="订单状态不允许取消")
 
-    recharge.status = "cancelled"
+    recharge.status = RechargeStatus.FAILED
     await db.commit()
     return {"message": "充值订单已取消"}
 
@@ -365,10 +464,10 @@ async def refund_consumption_order(
     order = result.scalar_one_or_none()
     if not order:
         raise HTTPException(status_code=404, detail="订单不存在")
-    if order.status != "completed":
+    if order.status != OrderStatus.PAID:
         raise HTTPException(status_code=400, detail="订单状态不允许退款")
 
-    order.status = "refunded"
+    order.status = OrderStatus.REFUNDED
     user_result = await db.execute(select(User).where(User.id == order.user_id))
     user = user_result.scalar_one_or_none()
     if user:

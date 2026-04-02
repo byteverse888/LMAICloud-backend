@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, Instance, AppImage
+from app.models import User, Instance, InstanceStatus, AppImage
 from app.schemas import (
     InstanceCreate, InstanceResponse, ResourceConfigResponse, PaginatedResponse,
 )
@@ -82,10 +82,10 @@ def _derive_instance_status(dep: dict, db_status: str = "") -> str:
     conditions = dep.get("conditions") or []
 
     if replicas == 0:
-        return "stopped"
+        return InstanceStatus.STOPPED
 
     if ready_replicas >= replicas and replicas > 0:
-        return "running"
+        return InstanceStatus.RUNNING
 
     # 检查 Deployment 明确失败条件
     for cond in conditions:
@@ -94,28 +94,28 @@ def _derive_instance_status(dep: dict, db_status: str = "") -> str:
         cond_reason = cond.get("reason", "")
         # ProgressDeadlineExceeded: Deployment 已超过滚动更新期限
         if cond_type == "Progressing" and cond_status == "False":
-            return "error"
+            return InstanceStatus.ERROR
         # ReplicaFailure: Pod 无法创建
         if cond_type == "ReplicaFailure":
-            return "error"
+            return InstanceStatus.ERROR
 
     # 若 DB 状态是 creating，Pod 尚在创建过程中（ContainerCreating 等），保持 creating
-    if db_status == "creating":
+    if db_status == InstanceStatus.CREATING:
         # 除非 Deployment 条件明确失败（上面已处理），否则保持 creating
         if available_replicas == 0 and updated_replicas == 0:
             # ReplicaSet 都没创建出来，仍可能在调度中，给时间
-            return "creating"
-        return "creating"
+            return InstanceStatus.CREATING
+        return InstanceStatus.CREATING
 
     # 有部分可用副本但尚未全部就绪 → 启动中
     if available_replicas > 0:
-        return "starting"
+        return InstanceStatus.STARTING
 
     # 没有可用副本且没有 updated_replicas → 大概率 Pod 无法调度/创建
     if available_replicas == 0 and updated_replicas == 0:
-        return "error"
+        return InstanceStatus.ERROR
 
-    return "starting"
+    return InstanceStatus.STARTING
 
 
 # ========== 资源配置 ==========
@@ -233,7 +233,7 @@ async def list_instances(
 
     # ── K8s 状态对齐（以 Deployment 为权威数据源）──────────────────────────
     # 对 DB 中仍处于"活跃"状态（非终态）的实例，从 K8s Deployment 获取真实状态覆盖
-    ACTIVE_STATUSES = {"running", "creating", "starting", "stopping"}
+    ACTIVE_STATUSES = {InstanceStatus.RUNNING, InstanceStatus.CREATING, InstanceStatus.STARTING, InstanceStatus.STOPPING}
     # 创建超时阈值：DB 状态仍为 creating 超过此时间 → 视为超时 error
     CREATING_TIMEOUT = timedelta(minutes=5)
 
@@ -286,15 +286,15 @@ async def list_instances(
             if dep:
                 # Deployment 存在 → 使用 _derive_instance_status 推导真实状态
                 inst_dict["status"] = _derive_instance_status(dep, db_status=inst.status)
-            elif inst.status == "creating":
+            elif inst.status == InstanceStatus.CREATING:
                 # 创建中 Deployment 尚不存在（后台任务可能还没跑完）
                 created = inst.created_at.replace(tzinfo=timezone.utc) if inst.created_at and inst.created_at.tzinfo is None else inst.created_at
                 if created and (now_utc - created) > CREATING_TIMEOUT:
-                    inst_dict["status"] = "error"  # 超时
-                # else: 保持 "creating"
-            elif inst.status in {"running", "starting"}:
+                    inst_dict["status"] = InstanceStatus.ERROR  # 超时
+                # else: 保持 creating
+            elif inst.status in {InstanceStatus.RUNNING, InstanceStatus.STARTING}:
                 # Deployment 在 K8s 中已不存在 → 标记为 error（Pod/Deployment 已消失）
-                inst_dict["status"] = "error"
+                inst_dict["status"] = InstanceStatus.ERROR
             # stopping 状态保留（等待后台任务完成删除）
 
         # 附加 Deployment 运行时信息（供前端展示）
@@ -429,7 +429,7 @@ async def create_instance(
         auto_shutdown_time=instance_data.auto_shutdown_time,
         auto_release_type=instance_data.auto_release_type,
         auto_release_minutes=instance_data.auto_release_minutes,
-        status="creating",
+        status=InstanceStatus.CREATING,
     )
 
     db.add(instance)
@@ -478,7 +478,7 @@ async def create_instance(
                 res = await session.execute(stmt)
                 inst = res.scalar_one_or_none()
                 if inst:
-                    inst.status = "error"
+                    inst.status = InstanceStatus.ERROR
                     inst.deployment_yaml = k8s_result.get("deployment_yaml", "")
                     await session.commit()
             try:
@@ -516,7 +516,7 @@ async def create_instance(
                 res = await session.execute(stmt)
                 inst = res.scalar_one_or_none()
                 if inst:
-                    inst.status = "running"
+                    inst.status = InstanceStatus.RUNNING
                     inst.started_at = datetime.utcnow()
                     inst.internal_ip = pod_ip
                     await session.commit()
@@ -637,7 +637,7 @@ async def start_instance(
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
-    if instance.status not in ("stopped", "error"):
+    if instance.status not in (InstanceStatus.STOPPED, InstanceStatus.ERROR):
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法启动")
 
     pod_manager = get_pod_manager()
@@ -646,7 +646,7 @@ async def start_instance(
     if not success:
         raise HTTPException(status_code=500, detail="启动失败")
 
-    instance.status = "starting"
+    instance.status = InstanceStatus.STARTING
     instance.started_at = datetime.utcnow()
     await db.commit()
 
@@ -668,7 +668,7 @@ async def start_instance(
                 res = await session.execute(stmt)
                 inst = res.scalar_one_or_none()
                 if inst:
-                    inst.status = "running"
+                    inst.status = InstanceStatus.RUNNING
                     pod_ip = poll_result.get("pod_ip", "")
                     if pod_ip:
                         inst.internal_ip = pod_ip
@@ -703,14 +703,14 @@ async def stop_instance(
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
-    if instance.status != "running":
+    if instance.status != InstanceStatus.RUNNING:
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法停止")
 
     pod_manager = get_pod_manager()
     inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
     success = await asyncio.to_thread(pod_manager.stop_instance, str(instance.id), inst_ns)
     if success:
-        instance.status = "stopped"
+        instance.status = InstanceStatus.STOPPED
         await db.commit()
         # 广播 WebSocket 通知前端
         try:
@@ -762,7 +762,7 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
 
     # 1. 先更新 DB 状态（立即响应，避免 K8s 操作阻塞导致 NetworkError）
     try:
-        instance.status = "released"
+        instance.status = InstanceStatus.RELEASED
         instance.release_at = datetime.utcnow()
         await db.commit()
         logger.info(f"实例 {instance_id} DB 状态已更新为 released, user={current_user.id}")
@@ -802,11 +802,11 @@ async def release_instance(
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
-    if instance.status in ("releasing", "released"):
+    if instance.status in (InstanceStatus.RELEASING, InstanceStatus.RELEASED):
         raise HTTPException(status_code=400, detail=f"实例已处于 {instance.status} 状态，无需重复操作")
 
     gpu_count = instance.gpu_count
-    instance.status = "releasing"
+    instance.status = InstanceStatus.RELEASING
     await db.commit()
 
     async def do_release(inst_id, gcount, user_id):
@@ -823,7 +823,7 @@ async def release_instance(
                 r = await s.execute(select(Instance).where(Instance.id == inst_id))
                 inst = r.scalar_one_or_none()
                 if inst:
-                    inst.status = "released"
+                    inst.status = InstanceStatus.RELEASED
                     inst.release_at = datetime.utcnow()
                     await s.commit()
                     logger.info(f"实例 {inst_id} 已删除")
@@ -902,14 +902,14 @@ async def get_instance_status(
                     "conditions": dep.get("conditions") or [],
                 }
                 k8s_status = _derive_instance_status(dep, db_status=instance.status)
-            elif instance.status == "creating":
+            elif instance.status == InstanceStatus.CREATING:
                 # 创建中 Deployment 尚不存在，保持 creating（除非超时）
                 now_utc = datetime.now(timezone.utc)
                 created = instance.created_at.replace(tzinfo=timezone.utc) if instance.created_at and instance.created_at.tzinfo is None else instance.created_at
                 if created and (now_utc - created) > timedelta(minutes=5):
-                    k8s_status = "error"
-            elif instance.status in {"running", "starting"}:
-                k8s_status = "error"
+                    k8s_status = InstanceStatus.ERROR
+            elif instance.status in {InstanceStatus.RUNNING, InstanceStatus.STARTING}:
+                k8s_status = InstanceStatus.ERROR
 
             # 查询关联 Pod
             pods = await asyncio.to_thread(

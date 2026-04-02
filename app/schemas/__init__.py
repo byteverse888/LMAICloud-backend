@@ -213,8 +213,8 @@ class ImageResponse(BaseModel):
     is_public: bool
     author: Optional[str]
     status: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -441,6 +441,8 @@ class OpenClawSpecUpdate(BaseModel):
 
 # -- 大模型密钥 --
 class ModelKeyCreate(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     provider: str  # openai/anthropic/deepseek/qwen/...
     alias: Optional[str] = None
     api_key: str
@@ -449,6 +451,8 @@ class ModelKeyCreate(BaseModel):
 
 
 class ModelKeyUpdate(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     alias: Optional[str] = None
     api_key: Optional[str] = None
     base_url: Optional[str] = None
@@ -457,6 +461,8 @@ class ModelKeyUpdate(BaseModel):
 
 
 class ModelKeyResponse(BaseModel):
+    model_config = {"from_attributes": True, "protected_namespaces": ()}
+
     id: UUID
     instance_id: UUID
     provider: str
@@ -470,9 +476,6 @@ class ModelKeyResponse(BaseModel):
     balance: Optional[float] = None
     tokens_used: int = 0
     created_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 # -- 通道配置 --
@@ -544,6 +547,8 @@ class MonitorChannelResponse(BaseModel):
 
 
 class MonitorStatusResponse(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     instance_id: UUID
     status: str
     internal_ip: Optional[str] = None
@@ -609,7 +614,7 @@ class ResourcePlanResponse(BaseModel):
     original_price: Optional[float] = None
     is_active: bool
     sort_order: int
-    created_at: datetime
+    created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     class Config:
@@ -703,7 +708,54 @@ class MarketProductResponse(BaseModel):
     tags: Optional[str] = None
     sort_order: int
     is_active: bool
-    created_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ========== 公开数据集 Schemas ==========
+
+class PublicDatasetCreate(BaseModel):
+    name: str
+    category: str = "dataset"  # dataset/model/image/video/audio
+    size: Optional[str] = None
+    downloads: int = 0
+    description: Optional[str] = None
+    tags: Optional[list] = []
+    source: Optional[str] = None
+    source_url: Optional[str] = None
+    is_active: bool = True
+    sort_order: int = 0
+
+
+class PublicDatasetUpdate(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    size: Optional[str] = None
+    downloads: Optional[int] = None
+    description: Optional[str] = None
+    tags: Optional[list] = None
+    source: Optional[str] = None
+    source_url: Optional[str] = None
+    is_active: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class PublicDatasetResponse(BaseModel):
+    id: UUID
+    name: str
+    category: str
+    size: Optional[str] = None
+    downloads: int = 0
+    description: Optional[str] = None
+    tags: Optional[list] = []
+    source: Optional[str] = None
+    source_url: Optional[str] = None
+    is_active: bool = True
+    sort_order: int = 0
+    created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
     class Config:
