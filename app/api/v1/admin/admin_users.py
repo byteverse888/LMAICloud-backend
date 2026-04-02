@@ -36,7 +36,10 @@ async def list_users(
             )
         )
     if status:
-        count_query = count_query.where(User.status == status)
+        try:
+            count_query = count_query.where(User.status == UserStatus(status))
+        except ValueError:
+            pass
     
     total_result = await db.execute(count_query)
     total = total_result.scalar() or 0
@@ -51,7 +54,10 @@ async def list_users(
             )
         )
     if status:
-        query = query.where(User.status == status)
+        try:
+            query = query.where(User.status == UserStatus(status))
+        except ValueError:
+            pass
     
     skip = (page - 1) * size
     query = query.order_by(User.created_at.desc()).offset(skip).limit(size)
@@ -90,7 +96,7 @@ async def get_user_stats(
     
     # 活跃用户
     active_count = await db.execute(
-        select(func.count(User.id)).where(User.status == "active")
+        select(func.count(User.id)).where(User.status == UserStatus.ACTIVE)
     )
     active_users = active_count.scalar()
     

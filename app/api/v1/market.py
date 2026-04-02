@@ -200,13 +200,26 @@ async def list_gpu_models():
 @router.get("/products")
 async def list_market_products(
     category: Optional[str] = None,
+    page: int = 1,
+    size: int = 50,
     db: AsyncSession = Depends(get_db),
 ):
-    """获取上架的市场产品列表（公开接口）"""
+    """获取上架的市场产品列表（公开接口，支持分页）"""
     q = select(MarketProduct).where(MarketProduct.is_active == True)
     if category:
         q = q.where(MarketProduct.category == category)
     q = q.order_by(MarketProduct.sort_order)
+
+    # 总数
+    from sqlalchemy import func
+    count_q = select(func.count()).select_from(
+        q.subquery()
+    )
+    total = (await db.execute(count_q)).scalar() or 0
+
+    # 分页
+    q = q.offset((page - 1) * size).limit(size)
     result = await db.execute(q)
     products = result.scalars().all()
-    return [MarketProductResponse.model_validate(p).model_dump() for p in products]
+    items = [MarketProductResponse.model_validate(p).model_dump() for p in products]
+    return {"list": items, "total": total, "page": page, "size": size}

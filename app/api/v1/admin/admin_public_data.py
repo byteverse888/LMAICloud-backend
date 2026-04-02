@@ -16,7 +16,7 @@ from app.schemas import (
     PublicDatasetUpdate,
     PublicDatasetResponse,
 )
-from app.utils.auth import get_current_admin
+from app.utils.auth import get_current_admin_user
 
 router = APIRouter()
 logger = logging.getLogger("lmaicloud.admin.public_data")
@@ -29,7 +29,7 @@ async def list_datasets(
     category: Optional[str] = None,
     search: Optional[str] = None,
     is_active: Optional[bool] = None,
-    _admin=Depends(get_current_admin),
+    _admin=Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
     query = select(PublicDataset)
@@ -66,7 +66,7 @@ async def list_datasets(
 @router.post("", summary="新增公开数据集")
 async def create_dataset(
     data: PublicDatasetCreate,
-    _admin=Depends(get_current_admin),
+    _admin=Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
     item = PublicDataset(**data.model_dump())
@@ -81,7 +81,7 @@ async def create_dataset(
 async def update_dataset(
     dataset_id: UUID,
     data: PublicDatasetUpdate,
-    _admin=Depends(get_current_admin),
+    _admin=Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
@@ -104,7 +104,7 @@ async def update_dataset(
 @router.delete("/{dataset_id}", summary="删除公开数据集")
 async def delete_dataset(
     dataset_id: UUID,
-    _admin=Depends(get_current_admin),
+    _admin=Depends(get_current_admin_user),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
