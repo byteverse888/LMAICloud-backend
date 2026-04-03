@@ -86,6 +86,9 @@ async def migrate_enum_values():
     # 注意: SQLAlchemy Enum(PythonEnum) 在 PG 中使用枚举**名称**（大写）作为存储值
     additions = [
         ("instancestatus", "RELEASED"),
+        ("auditaction", "LOGOUT"),
+        ("auditaction", "REGISTER"),
+        ("marketcategory", "AI_SERVER"),
     ]
 
     try:

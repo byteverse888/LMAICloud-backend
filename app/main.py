@@ -15,34 +15,45 @@ from app.api.v1 import websocket as ws
 from app.api.v1 import tickets, system, points, referral, audit_log, notifications
 from app.api.v1.admin import clusters, nodes, admin_users, admin_orders, reports, admin_settings, admin_images, admin_tickets
 from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admin_storage
-from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market, admin_public_data
+from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market, admin_public_data, admin_notifications, admin_referral
 
 # 初始化日志系统
 logger = setup_logging()
 
 
 async def _seed_default_settings():
-    """预置默认系统设置：仅当数据库中不存在时写入默认值"""
+    """预置默认系统设置：不存在则写入；协议类字段为空则更新为默认值"""
     from app.database import async_session_maker
     from app.models import SystemSetting
     from app.api.v1.admin.admin_settings import DEFAULT_SETTINGS
     from sqlalchemy import select
 
+    # 协议类字段：如果已存在但值为空字符串，也需要更新
+    agreement_keys = {"user_agreement", "privacy_policy", "service_agreement", "recharge_agreement"}
+
     try:
         async with async_session_maker() as db:
-            # 查询已有的 key
-            result = await db.execute(select(SystemSetting.key))
-            existing_keys = {row[0] for row in result.all()}
+            # 查询已有的设置
+            result = await db.execute(select(SystemSetting))
+            existing = {s.key: s for s in result.scalars().all()}
 
-            count = 0
+            created = 0
+            updated = 0
             for key, value in DEFAULT_SETTINGS.items():
-                if key not in existing_keys:
+                if key not in existing:
+                    # key 不存在 → 新增
                     db.add(SystemSetting(key=key, value=json.dumps(value)))
-                    count += 1
+                    created += 1
+                elif key in agreement_keys:
+                    # 协议字段已存在但为空 → 更新为默认值
+                    stored = json.loads(existing[key].value)
+                    if not stored:
+                        existing[key].value = json.dumps(value)
+                        updated += 1
 
-            if count > 0:
+            if created or updated:
                 await db.commit()
-                logger.info(f"预置 {count} 项默认系统设置")
+                logger.info(f"预置系统设置: 新增 {created} 项, 更新 {updated} 项空协议")
             else:
                 logger.info("系统设置已存在，跳过预置")
     except Exception as e:
@@ -275,6 +286,8 @@ app.include_router(admin_storage.router, prefix="/api/v1/admin/storage", tags=["
 app.include_router(admin_openclaw.router, prefix="/api/v1/admin/openclaw", tags=["管理-OpenClaw"])
 app.include_router(admin_dashboard.router, prefix="/api/v1/admin/dashboard", tags=["管理-仪表盘"])
 app.include_router(admin_market.router, prefix="/api/v1/admin/market", tags=["管理-市场"])
+app.include_router(admin_notifications.router, prefix="/api/v1/admin/notifications", tags=["管理-通知"])
+app.include_router(admin_referral.router, prefix="/api/v1/admin/referral", tags=["管理-推广"])
 app.include_router(admin_public_data.router, prefix="/api/v1/admin/public-data", tags=["管理-公开数据"])
 
 # WebSocket routes

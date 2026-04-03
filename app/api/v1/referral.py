@@ -33,11 +33,19 @@ async def get_referral_info(
     count_q = select(func.count(AIUser.id)).where(AIUser.invited_by == current_user.id)
     invited_count = (await db.execute(count_q)).scalar() or 0
 
+    # 统计已激活的邀请人数（用于计算总积分）
+    verified_count_q = select(func.count(AIUser.id)).where(
+        AIUser.invited_by == current_user.id,
+        AIUser.verified == True,
+    )
+    verified_count = (await db.execute(verified_count_q)).scalar() or 0
+
     return {
         "invite_code": current_user.invite_code,
         "invite_link": f"/register?invite={current_user.invite_code}",
         "invited_count": invited_count,
         "points_per_invite": 50,
+        "total_reward_points": verified_count * 50,
     }
 
 
@@ -77,7 +85,8 @@ async def get_referral_records(
         records.append({
             "user_email": masked_email,
             "registered_at": u.created_at.isoformat() if u.created_at else None,
-            "reward_points": 50,
+            "verified": u.verified,
+            "reward_points": 50 if u.verified else 0,
         })
 
     return {

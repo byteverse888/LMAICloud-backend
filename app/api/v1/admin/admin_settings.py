@@ -132,6 +132,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "recharge_agreement": _DEFAULT_RECHARGE_AGREEMENT,
     # 验证码
     "captcha_enabled": True,
+    # 公告
+    "announcement_text": "",
 }
 
 
@@ -164,6 +166,8 @@ class SystemSettingsUpdate(BaseModel):
     service_agreement: Optional[str] = None
     # 验证码
     captcha_enabled: Optional[bool] = None
+    # 公告
+    announcement_text: Optional[str] = None
 
 
 class EmailConfigUpdate(BaseModel):

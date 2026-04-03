@@ -286,6 +286,7 @@ async def login_with_code(
 async def register(
     user_data: UserCreate,
     background_tasks: BackgroundTasks,
+    request: Request,
     db: AsyncSession = Depends(get_db)
 ):
     """用户注册 - 发送激活邮件"""
@@ -369,13 +370,27 @@ async def register(
     await db.commit()
     await db.refresh(user)
     
-    # 给邀请人发放50积分奖励
+    # 绑定邀请关系（积分奖励延迟到激活时发放）
     if inviter:
-        await add_points(db, inviter.id, 50, PointType.INVITE_REWARD, f"邀请用户 {user.email} 注册奖励")
-        await db.commit()
+        pass  # invited_by 已在上方设置，奖励在 activate_email 中发放
     
     logger.info(f"用户注册成功: {user.email}, ID: {user.id}")
-    
+
+    # 记录注册日志
+    try:
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
+        from app.models import AuditAction, AuditResourceType
+        client_ip = get_client_ip(request)
+        await create_audit_log(
+            db, user.id, AuditAction.REGISTER, AuditResourceType.ACCOUNT,
+            resource_name=user.email,
+            detail=f"新用户注册",
+            ip_address=client_ip,
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录注册日志失败: {e}")
+
     # 如果需要邮箱验证，发送激活邮件
     if email_verification_required:
         # 获取站点名称
@@ -442,7 +457,16 @@ async def activate_email(
     user.activation_token = None
     user.activation_expires_at = None
     await db.commit()
-    
+
+    # 如果是被邀请用户，激活后给邀请人发放积分奖励
+    if user.invited_by:
+        try:
+            await add_points(db, user.invited_by, 50, PointType.INVITE_REWARD, f"邀请用户 {user.email} 激活奖励")
+            await db.commit()
+            logger.info(f"邀请奖励已发放: inviter={user.invited_by}, invited={user.email}")
+        except Exception as e:
+            logger.warning(f"发放邀请奖励失败: {e}")
+
     logger.info(f"邮箱激活成功: {user.email}")
     return {"message": "邮箱激活成功！现在可以登录了", "activated": True}
 
@@ -535,7 +559,8 @@ async def login(user_data: UserLogin, request: Request, db: AsyncSession = Depen
     logger.info(f"用户登录请求: {user_data.email}")
 
     # 速率限制（IP + 邮箱）
-    client_ip = request.client.host if request.client else "unknown"
+    from app.api.v1.audit_log import get_client_ip
+    client_ip = get_client_ip(request)
     _check_login_rate(f"ip:{client_ip}", LOGIN_MAX_ATTEMPTS_IP)
     _check_login_rate(f"email:{user_data.email}", LOGIN_MAX_ATTEMPTS_EMAIL)
     
@@ -569,6 +594,21 @@ async def login(user_data: UserLogin, request: Request, db: AsyncSession = Depen
     access_token = create_access_token(data={"sub": str(user.id)})
     refresh_token = create_refresh_token(data={"sub": str(user.id)})
     
+    # 记录登录日志
+    try:
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
+        from app.models import AuditAction, AuditResourceType
+        user_agent = request.headers.get("user-agent", "")
+        await create_audit_log(
+            db, user.id, AuditAction.LOGIN, AuditResourceType.ACCOUNT,
+            resource_name=user.email,
+            detail=user_agent[:200],
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录登录日志失败: {e}")
+    
     logger.info(f"用户登录成功: {user.email}, ID: {user.id}")
     return LoginResponse(user=user, token=access_token, refresh_token=refresh_token)
 
@@ -579,7 +619,23 @@ async def get_me(current_user: User = Depends(get_current_user)):
 
 
 @router.post("/logout")
-async def logout():
+async def logout(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # 记录登出日志
+    try:
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.LOGOUT, AuditResourceType.ACCOUNT,
+            resource_name=current_user.email,
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录登出日志失败: {e}")
     return {"message": "Successfully logged out"}
 
 

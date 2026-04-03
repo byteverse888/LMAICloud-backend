@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -400,6 +400,11 @@ async def create_instance(
 
     gpu_count = instance_data.gpu_count if instance_data.resource_type != "no_gpu" else 0
     user_ns = PodManager.user_namespace(str(current_user.id))
+
+    # 使用用户选择的规格，若未传则回退到节点真实值
+    user_cpu = instance_data.cpu_cores if instance_data.cpu_cores else nd_cpu
+    user_mem = instance_data.memory_gb if instance_data.memory_gb else nd_mem
+
     instance = Instance(
         user_id=current_user.id,
         node_id=None,  # 不再关联 DB nodes 表
@@ -408,8 +413,8 @@ async def create_instance(
         namespace=user_ns,
         gpu_count=gpu_count,
         gpu_model=instance_data.gpu_model or nd_gpu_model,
-        cpu_cores=nd_cpu,
-        memory=nd_mem,
+        cpu_cores=user_cpu,
+        memory=user_mem,
         disk=50,
         resource_type=instance_data.resource_type,
         node_type=instance_data.node_type,
@@ -437,6 +442,19 @@ async def create_instance(
     await db.refresh(instance)
     logger.info(f"实例记录已创建 - ID: {instance.id}, 节点: {nd_name}")
 
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.CREATE, AuditResourceType.INSTANCE,
+            resource_id=str(instance.id), resource_name=instance.name,
+            detail=f"GPU:{gpu_count}, 节点:{nd_name}, 镜像:{image_url}",
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录创建实例日志失败: {e}")
+
     # 后台: 生成 Deployment YAML -> 调用 K8s -> 轮询 Pod 就绪
     async def create_k8s_resources(inst_id, k8s_node_name, nd_type):
         pod_manager = get_pod_manager()
@@ -455,8 +473,8 @@ async def create_instance(
             user_id=str(current_user.id),
             image=image_url,
             gpu_count=gpu_count,
-            cpu_cores=max(1, nd_cpu // max(1, instance_data.instance_count)),
-            memory_gb=max(2, nd_mem // max(1, instance_data.instance_count)),
+            cpu_cores=max(1, user_cpu // max(1, instance_data.instance_count)),
+            memory_gb=max(2, user_mem // max(1, instance_data.instance_count)),
             disk_gb=50,
             node_name=k8s_node_name,
             node_type=nd_type,
@@ -650,6 +668,18 @@ async def start_instance(
     instance.started_at = datetime.utcnow()
     await db.commit()
 
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.START, AuditResourceType.INSTANCE,
+            resource_id=str(instance.id), resource_name=instance.name,
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录启动实例日志失败: {e}")
+
     # 后台轮询 Pod 就绪状态并更新 DB
     async def wait_for_running(inst_id, user_id):
         k8s_cli = get_k8s_client()
@@ -712,6 +742,17 @@ async def stop_instance(
     if success:
         instance.status = InstanceStatus.STOPPED
         await db.commit()
+        # 记录审计日志
+        try:
+            from app.api.v1.audit_log import create_audit_log
+            from app.models import AuditAction, AuditResourceType
+            await create_audit_log(
+                db, current_user.id, AuditAction.STOP, AuditResourceType.INSTANCE,
+                resource_id=str(instance.id), resource_name=instance.name,
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"记录停止实例日志失败: {e}")
         # 广播 WebSocket 通知前端
         try:
             await broadcast_instance_status(str(instance.id), str(current_user.id), "stopped")
@@ -761,11 +802,24 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
         raise HTTPException(status_code=404, detail="实例不存在")
 
     # 1. 先更新 DB 状态（立即响应，避免 K8s 操作阻塞导致 NetworkError）
+    inst_name = instance.name
     try:
         instance.status = InstanceStatus.RELEASED
         instance.release_at = datetime.utcnow()
         await db.commit()
         logger.info(f"实例 {instance_id} DB 状态已更新为 released, user={current_user.id}")
+        # 记录审计日志
+        try:
+            from app.api.v1.audit_log import create_audit_log
+            from app.models import AuditAction, AuditResourceType
+            await create_audit_log(
+                db, current_user.id, AuditAction.DELETE, AuditResourceType.INSTANCE,
+                resource_id=str(instance_id), resource_name=inst_name,
+                detail="强制删除",
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"记录强制删除日志失败: {e}")
     except Exception as e:
         logger.error(f"强制删除 DB 更新失败: {e}")
         await db.rollback()
@@ -808,6 +862,18 @@ async def release_instance(
     gpu_count = instance.gpu_count
     instance.status = InstanceStatus.RELEASING
     await db.commit()
+
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.DELETE, AuditResourceType.INSTANCE,
+            resource_id=str(instance.id), resource_name=instance.name,
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录删除实例日志失败: {e}")
 
     async def do_release(inst_id, gcount, user_id):
         # K8s 清理: 失败不阻塞，DB 状态必须更新

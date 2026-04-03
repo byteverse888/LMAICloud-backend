@@ -78,6 +78,12 @@ class InstanceCreate(BaseModel):
     billing_type: str = "hourly"
     duration_hours: Optional[int] = None
 
+    # 规格配置（用户选择的 CPU/内存规格）
+    cpu_cores: int = Field(default=2, ge=1, le=64, description="CPU 核数")
+    memory_gb: int = Field(default=4, ge=1, le=256, description="内存 GB")
+    spec_type: Optional[str] = None  # general / compute / memory
+    spec_label: Optional[str] = None  # 规格标签，如 '2核4G'
+
     # 资源类型与节点类型
     resource_type: str = "vGPU"       # vGPU / no_gpu
     node_type: str = "center"         # center / edge
@@ -671,7 +677,7 @@ class NotificationResponse(BaseModel):
 # ========== 市场产品 Schemas ==========
 
 class MarketProductCreate(BaseModel):
-    category: str  # compute / ai_app
+    category: str  # compute / ai_app / ai_server
     name: str
     description: Optional[str] = None
     icon: Optional[str] = None

@@ -117,6 +117,21 @@ async def create_instance(
     inst.status = "creating"
     await db.commit()
     await db.refresh(inst)
+
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.CREATE, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+            detail=f"镜像:{image}, 节点:{req.node_name}",
+        )
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"记录创建OpenClaw日志失败: {e}")
+
     return inst
 
 
@@ -166,6 +181,20 @@ async def delete_instance(
 
     inst.status = "released"
     await db.commit()
+
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.DELETE, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+        )
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"记录删除OpenClaw日志失败: {e}")
+
     return {"detail": "实例已释放"}
 
 
@@ -188,6 +217,20 @@ async def start_instance(
     inst.status = "creating"
     inst.started_at = datetime.utcnow()
     await db.commit()
+
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.START, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+        )
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"记录启动OpenClaw日志失败: {e}")
+
     return {"detail": "启动中"}
 
 
@@ -209,6 +252,20 @@ async def stop_instance(
 
     inst.status = "stopped"
     await db.commit()
+
+    # 记录审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.STOP, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+        )
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"记录停止OpenClaw日志失败: {e}")
+
     return {"detail": "已停止"}
 
 

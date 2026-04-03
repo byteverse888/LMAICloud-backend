@@ -627,6 +627,8 @@ class AuditAction(str, enum.Enum):
     STOP = "stop"
     RESTART = "restart"
     LOGIN = "login"
+    LOGOUT = "logout"
+    REGISTER = "register"
     RECHARGE = "recharge"
 
 
@@ -683,8 +685,9 @@ class Notification(Base):
 # ========== 市场产品 ==========
 
 class MarketCategory(str, enum.Enum):
-    COMPUTE = "compute"   # 算力市场
-    AI_APP = "ai_app"     # AI应用
+    COMPUTE = "compute"     # 算力市场
+    AI_APP = "ai_app"       # AI应用
+    AI_SERVER = "ai_server" # AI服务器
 
 
 class MarketProduct(Base):

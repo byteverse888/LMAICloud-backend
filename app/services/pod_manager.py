@@ -70,12 +70,11 @@ class PodManager:
         }
 
         # --- 资源限制 ---
-        # CPU 用毫核(m)，合理分配而非占满整个节点
-        # limits 取传入值但设上限，requests 设为较小值保证可调度
-        cpu_limit = min(cpu_cores, 4)      # 单 Pod 最高 4 核
-        cpu_request_m = max(100, min(cpu_cores * 250, 2000))  # 250m/核，最低100m 最高2000m
-        mem_limit = min(memory_gb, 16)     # 单 Pod 最高 16Gi
-        mem_request = max(1, mem_limit // 4)  # requests = limits/4，至少 1Gi
+        # limits = 用户选择的规格，requests = 规格的一半（保证可调度）
+        cpu_limit = max(1, cpu_cores)          # limits = 用户规格
+        cpu_request_m = max(100, cpu_cores * 500)  # requests = 规格的一半 (cores * 1000m / 2)
+        mem_limit = max(1, memory_gb)           # limits = 用户规格
+        mem_request = max(1, memory_gb // 2) if memory_gb > 1 else 1  # requests = 规格的一半
 
         resources = {
             "limits": {

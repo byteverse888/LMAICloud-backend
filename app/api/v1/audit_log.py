@@ -13,6 +13,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def get_client_ip(request: Request) -> str:
+    """获取真实客户端 IP（支持反向代理）
+
+    优先级：X-Forwarded-For 第一个 IP > X-Real-IP > request.client.host
+    """
+    # X-Forwarded-For: client, proxy1, proxy2
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        # 取第一个（原始客户端 IP）
+        return forwarded_for.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host if request.client else "unknown"
+
+
 async def create_audit_log(
     db: AsyncSession,
     user_id,
@@ -84,6 +100,55 @@ async def get_audit_logs(
                 "resource_name": l.resource_name,
                 "detail": l.detail,
                 "ip_address": l.ip_address,
+                "created_at": l.created_at.isoformat() if l.created_at else None,
+            }
+            for l in logs
+        ],
+        "total": total,
+        "page": page,
+        "size": size,
+    }
+
+
+@router.get("/access-log")
+async def get_access_logs(
+    page: int = 1,
+    size: int = 20,
+    days: int = 30,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user),
+):
+    """用户端 - 查看自己的登录/访问记录"""
+    from datetime import datetime, timedelta
+    offset = (page - 1) * size
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    conditions = [
+        AuditLog.user_id == current_user.id,
+        or_(AuditLog.action == AuditAction.LOGIN, AuditLog.action == AuditAction.LOGOUT),
+        AuditLog.created_at >= cutoff,
+    ]
+
+    count_q = select(func.count(AuditLog.id)).where(*conditions)
+    total = (await db.execute(count_q)).scalar() or 0
+
+    q = (
+        select(AuditLog)
+        .where(*conditions)
+        .order_by(desc(AuditLog.created_at))
+        .offset(offset)
+        .limit(size)
+    )
+    result = await db.execute(q)
+    logs = result.scalars().all()
+
+    return {
+        "list": [
+            {
+                "id": str(l.id),
+                "action": l.action.value if l.action else "login",
+                "ip_address": l.ip_address or "",
+                "device": l.detail or "",
                 "created_at": l.created_at.isoformat() if l.created_at else None,
             }
             for l in logs

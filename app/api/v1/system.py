@@ -17,6 +17,7 @@ SITE_INFO_KEYS = [
     "site_name", "site_description", "contact_email",
     "site_logo", "footer_text", "icp_number", "icp_link",
     "police_number", "copyright_text", "captcha_enabled",
+    "announcement_text",
 ]
 
 
@@ -39,6 +40,7 @@ async def get_site_info(db: AsyncSession = Depends(get_db)):
         "police_number": db_settings.get("police_number", ""),
         "copyright_text": db_settings.get("copyright_text", "© 2025 LMAICloud. All rights reserved."),
         "captcha_enabled": db_settings.get("captcha_enabled", True),
+        "announcement_text": db_settings.get("announcement_text", ""),
     }
 
 

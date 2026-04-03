@@ -234,11 +234,11 @@ class OpenClawManager:
             "openclaw-instance": str(instance_id),
         }
 
-        # 资源限制
+        # 资源限制: limits = 用户规格, requests = 规格的一半
         cpu_limit = max(1, min(cpu_cores, 8))
-        cpu_request_m = max(250, cpu_limit * 250)
+        cpu_request_m = max(250, cpu_limit * 500)   # requests = limits / 2
         mem_limit = max(1, min(memory_gb, 32))
-        mem_request = max(1, mem_limit // 2)
+        mem_request = max(1, mem_limit // 2) if mem_limit > 1 else 1  # requests = limits / 2
 
         container = {
             "name": "openclaw",
