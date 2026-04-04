@@ -7,7 +7,7 @@ from datetime import datetime
 from uuid import UUID
 
 from app.database import get_db
-from app.models import User, UserRole, UserStatus, Instance, Order, InstanceStatus, AuditAction, AuditResourceType
+from app.models import User, UserRole, UserStatus, Instance, Order, InstanceStatus, AuditAction, AuditResourceType, OpenClawInstance
 from app.schemas import UserResponse, UserCreate
 from app.utils.auth import get_current_admin_user, get_password_hash
 from app.logging_config import get_logger
@@ -65,11 +65,14 @@ async def list_users(
     result = await db.execute(query)
     users = result.scalars().all()
     
-    # 获取用户实例数
+    # 获取用户有效实例数（排除 released / error）
     user_list = []
     for user in users:
         instance_count = await db.execute(
-            select(func.count(Instance.id)).where(Instance.user_id == user.id)
+            select(func.count(Instance.id)).where(
+                Instance.user_id == user.id,
+                Instance.status.notin_(['released', 'error'])
+            )
         )
         user_list.append({
             "id": str(user.id),
@@ -79,6 +82,7 @@ async def list_users(
             "status": user.status.value if hasattr(user.status, 'value') else str(user.status),
             "verified": user.verified if hasattr(user, 'verified') else False,
             "instances": instance_count.scalar() or 0,
+            "instance_quota": user.instance_quota if hasattr(user, 'instance_quota') else 20,
             "created_at": user.created_at.strftime("%Y-%m-%d %H:%M") if user.created_at else "",
         })
     
@@ -226,6 +230,33 @@ async def adjust_user_balance(
         "new_balance": user.balance,
         "adjustment": amount,
         "reason": reason,
+    }
+
+
+@router.put("/{user_id}/quota")
+async def adjust_user_quota(
+    user_id: UUID,
+    quota: int = Query(..., ge=0, le=1000),
+    db: AsyncSession = Depends(get_db),
+    current_user = Depends(get_current_admin_user),
+):
+    """调整用户实例配额"""
+    result = await db.execute(
+        select(User).where(User.id == user_id)
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    
+    old_quota = user.instance_quota if hasattr(user, 'instance_quota') else 20
+    user.instance_quota = quota
+    user.updated_at = datetime.utcnow()
+    await db.commit()
+    
+    return {
+        "message": "配额调整成功",
+        "old_quota": old_quota,
+        "new_quota": quota,
     }
 
 

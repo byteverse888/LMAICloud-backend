@@ -36,6 +36,7 @@ class AIUser(Base):
     activation_expires_at = Column(DateTime, nullable=True)  # 激活令牌过期时间
     storage_quota = Column(BigInteger, default=10 * 1024**3)  # 总存储配额(字节), 默认10GB
     storage_used = Column(BigInteger, default=0)               # 已用存储空间(字节)
+    instance_quota = Column(Integer, default=20)               # 实例配额(容器+OpenClaw总数上限)
     # 积分系统
     points = Column(Integer, default=0)  # 积分余额
     invite_code = Column(String(20), unique=True, nullable=True, index=True)  # 邀请码
@@ -308,6 +309,8 @@ class BillingRecord(Base):
     period_start = Column(DateTime, nullable=False)    # 计费区间起点
     period_end = Column(DateTime, nullable=False)      # 计费区间终点
     description = Column(String(200))
+    instance_name = Column(String(100), nullable=True)  # 冗余存储实例名称
+    resource_type = Column(String(20), nullable=True)   # gpu / openclaw
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("AIUser")
@@ -490,6 +493,11 @@ class OpenClawInstance(Base):
     # 镜像 & 端口
     image_url = Column(String(500))  # Docker 镜像地址
     port = Column(Integer, default=18789)  # Gateway 端口
+
+    # 计费
+    billing_type = Column(String(20), default="hourly")  # hourly/monthly/yearly
+    hourly_price = Column(Float, default=0.12)  # 元/小时
+    expired_at = Column(DateTime, nullable=True)  # 包月/包年到期时间
 
     # K8s 资源名
     deployment_name = Column(String(200))

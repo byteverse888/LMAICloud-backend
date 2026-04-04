@@ -12,10 +12,10 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus
+from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus, OpenClawInstance
 from app.schemas import (
     InstanceCreate, InstanceResponse, ResourceConfigResponse, PaginatedResponse,
 )
@@ -348,6 +348,27 @@ async def create_instance(
         f"node_id(K8s节点): {instance_data.node_id}"
     )
 
+    # 实例配额校验
+    inst_count_q = await db.execute(
+        select(func.count(Instance.id)).where(
+            Instance.user_id == current_user.id,
+            Instance.status.notin_(['released', 'error'])
+        )
+    )
+    oc_count_q = await db.execute(
+        select(func.count(OpenClawInstance.id)).where(
+            OpenClawInstance.user_id == current_user.id,
+            OpenClawInstance.status.notin_(['released', 'error'])
+        )
+    )
+    current_total = (inst_count_q.scalar() or 0) + (oc_count_q.scalar() or 0)
+    quota = getattr(current_user, 'instance_quota', None) or 20
+    if current_total + instance_data.instance_count > quota:
+        raise HTTPException(
+            status_code=400,
+            detail=f"实例配额不足：已使用 {current_total}/{quota}，无法再创建 {instance_data.instance_count} 个实例"
+        )
+
     # 从 K8s 实时获取节点信息（放入线程池避免阻塞事件循环）
     k8s = get_k8s_client()
     kn = await asyncio.to_thread(k8s.get_node, str(instance_data.node_id))
@@ -482,7 +503,7 @@ async def create_instance(
                 amount=-period_price,
                 status=OrderStatus.PAID,
                 paid_at=datetime.utcnow(),
-                product_name=f"{instance.gpu_model or 'GPU'} 容器实例",
+                product_name=f"容器实例 - {instance.name}",
                 billing_cycle=billing_cycle,
                 description="创建容器实例 - {} ({}首期)".format(instance.name, '包月' if billing_cycle == 'monthly' else '包年'),
             )
@@ -496,7 +517,7 @@ async def create_instance(
                 amount=0,
                 status=OrderStatus.PAID,
                 paid_at=datetime.utcnow(),
-                product_name=f"{instance.gpu_model or 'GPU'} 容器实例",
+                product_name=f"容器实例 - {instance.name}",
                 billing_cycle=billing_cycle,
                 description=f"创建容器实例 - {instance.name} (按量计费)",
             )

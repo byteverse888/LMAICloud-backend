@@ -10,13 +10,13 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.models import (
     AIUser as User, OpenClawInstance, ModelKey, Channel, OpenClawSkill,
-    Order, OrderType, OrderStatus,
+    Order, OrderType, OrderStatus, Instance,
 )
 from app.schemas import (
     OpenClawInstanceCreate, OpenClawInstanceResponse, OpenClawSpecUpdate,
@@ -69,16 +69,70 @@ async def create_instance(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """创建 OpenClaw 实例"""
-    # 余额检查：至少够1小时费用
-    min_balance = settings.default_gpu_hourly_price
-    if current_user.balance < min_balance:
-        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+    """创建 OpenClaw 实例（支持按量/包月/包年 + 创建时配置模型/通道/技能）"""
+    from dateutil.relativedelta import relativedelta
+
+    # ── 实例配额校验 ──
+    inst_count_q = await db.execute(
+        select(func.count(Instance.id)).where(
+            Instance.user_id == current_user.id,
+            Instance.status.notin_(['released', 'error'])
+        )
+    )
+    oc_count_q = await db.execute(
+        select(func.count(OpenClawInstance.id)).where(
+            OpenClawInstance.user_id == current_user.id,
+            OpenClawInstance.status.notin_(['released', 'error'])
+        )
+    )
+    current_total = (inst_count_q.scalar() or 0) + (oc_count_q.scalar() or 0)
+    quota = getattr(current_user, 'instance_quota', None) or 20
+    if current_total + 1 > quota:
+        raise HTTPException(
+            status_code=400,
+            detail=f"实例配额不足：已使用 {current_total}/{quota}，无法再创建 OpenClaw 实例"
+        )
+
+    # ── 规格价格表 ──
+    SPEC_PRICES = {
+        (1, 2):   0.06,   # 入门型
+        (2, 4):   0.12,   # 通用型
+        (4, 8):   0.24,   # 专业型
+        (8, 16):  0.48,   # 旗舰型
+    }
+    hourly_price = SPEC_PRICES.get((req.cpu_cores, req.memory_gb), 0.12)
+
+    # ── 计费模式解析 ──
+    billing_type_val = "hourly"
+    first_charge = 0.0
+    expired_at = None
+    duration_months = req.duration_months or 1
+
+    if req.billing_type == "monthly":
+        billing_type_val = "monthly"
+        first_charge = round(hourly_price * 24 * 30 * duration_months, 2)
+        expired_at = datetime.utcnow() + relativedelta(months=duration_months)
+    elif req.billing_type == "yearly":
+        billing_type_val = "yearly"
+        first_charge = round(hourly_price * 24 * 365, 2)
+        expired_at = datetime.utcnow() + relativedelta(years=1)
+
+    # ── 余额检查 ──
+    if req.billing_type in ("monthly", "yearly"):
+        if current_user.balance < first_charge:
+            raise HTTPException(
+                status_code=400,
+                detail=f"余额不足，需要 ¥{first_charge:.2f}，当前余额 ¥{current_user.balance:.2f}"
+            )
+    else:
+        min_balance = hourly_price  # 至少夨1小时
+        if current_user.balance < min_balance:
+            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
 
     user_ns = PodManager.user_namespace(str(current_user.id))
     image = req.image_url or settings.openclaw_default_image
 
-    # DB 记录
+    # ── DB 记录 ──
     inst = OpenClawInstance(
         user_id=current_user.id,
         name=req.name,
@@ -91,11 +145,66 @@ async def create_instance(
         disk_gb=req.disk_gb,
         image_url=image,
         port=req.port,
+        billing_type=billing_type_val,
+        hourly_price=hourly_price,
+        expired_at=expired_at,
     )
     db.add(inst)
     await db.flush()  # 获取 inst.id
 
-    # K8s 资源创建（后台线程）
+    # ── 创建时批量添加模型密钥 ──
+    init_model_keys = []
+    if req.model_keys:
+        for mk_req in req.model_keys:
+            mk = ModelKey(
+                instance_id=inst.id,
+                provider=mk_req.provider,
+                alias=mk_req.alias,
+                api_key=mk_req.api_key,
+                base_url=mk_req.base_url,
+                model_name=mk_req.model_name,
+            )
+            db.add(mk)
+            init_model_keys.append({
+                "provider": mk_req.provider,
+                "api_key": mk_req.api_key,
+                "base_url": mk_req.base_url,
+                "is_active": True,
+            })
+
+    # ── 创建时批量添加通道 ──
+    init_channels = []
+    if req.channels:
+        for ch_req in req.channels:
+            ch = Channel(
+                instance_id=inst.id,
+                type=ch_req.type,
+                name=ch_req.name,
+                config=ch_req.config,
+            )
+            db.add(ch)
+            init_channels.append({
+                "type": ch_req.type,
+                "name": ch_req.name,
+                "config": ch_req.config,
+                "is_active": True,
+            })
+
+    # ── 创建时批量添加技能 ──
+    if req.skills:
+        for sk_req in req.skills:
+            skill = OpenClawSkill(
+                instance_id=inst.id,
+                name=sk_req.name,
+                description=sk_req.description,
+                version=sk_req.version,
+                status="installing",
+            )
+            db.add(skill)
+
+    await db.flush()
+
+    # ── K8s 资源创建 ──
     mgr = get_openclaw_manager()
     k8s_result = await asyncio.to_thread(
         mgr.create_instance,
@@ -110,6 +219,8 @@ async def create_instance(
         node_type=req.node_type,
         storage_class=settings.openclaw_storage_class,
         edge_storage_path=settings.openclaw_edge_storage_path,
+        model_keys=init_model_keys if init_model_keys else None,
+        channels=init_channels if init_channels else None,
     )
 
     if not k8s_result.get("success"):
@@ -121,37 +232,41 @@ async def create_instance(
     inst.service_name = k8s_result["service_name"]
     inst.gateway_token = k8s_result["gateway_token"]
     inst.status = "creating"
+
+    # ── 首期扣费（包月/包年） ──
+    if first_charge > 0:
+        current_user.balance -= first_charge
+
     await db.commit()
     await db.refresh(inst)
 
-    # 记录审计日志
+    # ── 审计日志 ──
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
         await create_audit_log(
             db, current_user.id, AuditAction.CREATE, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
-            detail=f"镜像:{image}, 节点:{req.node_name}",
+            detail=f"镜像:{image}, 规格:{req.cpu_cores}C{req.memory_gb}G, 计费:{req.billing_type}",
         )
         await db.commit()
     except Exception as e:
         import logging
         logging.getLogger(__name__).warning(f"记录创建OpenClaw日志失败: {e}")
 
-    # 计费说明：创建时不扣费，等实例进入 RUNNING 状态后由定时任务按实际运行时长计费
-
-    # 创建订单记录（不扣费，仅作为订单记录）
+    # ── 订单记录 ──
     try:
+        billing_label = {"hourly": "按量计费", "monthly": "包月", "yearly": "包年"}.get(req.billing_type, "按量计费")
         create_order = Order(
             user_id=current_user.id,
             openclaw_instance_id=inst.id,
             type=OrderType.CREATE,
-            amount=0,
+            amount=first_charge,
             status=OrderStatus.PAID,
             paid_at=datetime.utcnow(),
-            product_name="OpenClaw AI Agent",
-            billing_cycle='hourly',
-            description=f"创建 OpenClaw 实例 - {inst.name}",
+            product_name=f"OpenClaw实例 - {inst.name}",
+            billing_cycle=req.billing_type,
+            description=f"创建 OpenClaw 实例 - {inst.name} ({billing_label})",
         )
         db.add(create_order)
         await db.commit()
@@ -247,11 +362,18 @@ async def start_instance(
     inst = await _get_instance_or_404(instance_id, current_user, db)
     if inst.status not in ("stopped", "error"):
         raise HTTPException(status_code=400, detail=f"当前状态 {inst.status} 不可启动")
-
-    # 余额检查：至少够1小时费用
-    min_balance = settings.default_gpu_hourly_price
-    if current_user.balance < min_balance:
-        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+    
+    # 余额检查：区分计费模式
+    bt = inst.billing_type.value if inst.billing_type else "hourly"
+    if bt in ("monthly", "yearly"):
+        # 包月/包年：检查是否过期
+        if inst.expired_at and datetime.utcnow() > inst.expired_at:
+            raise HTTPException(status_code=400, detail="实例已过期，请先续费")
+    else:
+        # 按量：至少夨1小时
+        min_balance = inst.hourly_price or settings.default_gpu_hourly_price
+        if current_user.balance < min_balance:
+            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
 
     mgr = get_openclaw_manager()
     ok = await asyncio.to_thread(mgr.start_instance, str(inst.id), inst.namespace)

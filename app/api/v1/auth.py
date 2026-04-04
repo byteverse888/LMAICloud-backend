@@ -628,9 +628,11 @@ async def logout(
     try:
         from app.api.v1.audit_log import create_audit_log, get_client_ip
         from app.models import AuditAction, AuditResourceType
+        user_agent = request.headers.get("user-agent", "")
         await create_audit_log(
             db, current_user.id, AuditAction.LOGOUT, AuditResourceType.ACCOUNT,
             resource_name=current_user.email,
+            detail=user_agent[:200],
             ip_address=get_client_ip(request),
         )
         await db.commit()

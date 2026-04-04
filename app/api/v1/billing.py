@@ -540,8 +540,12 @@ async def list_transactions(
                 "description": record.description or "按量计费",
                 "product_name": None,
                 "billing_cycle": "hourly",
+                "resource_type": record.resource_type,
+                "resource_name": record.instance_name,
             })
         for order in all_orders:
+            # 解析订单关联的实例类型
+            o_res_type = "openclaw" if order.openclaw_instance_id else ("gpu" if order.instance_id else None)
             transactions.append({
                 "id": str(order.id),
                 "type": "consumption",
@@ -551,6 +555,8 @@ async def list_transactions(
                 "description": order.description or order.product_name or f"{order.type}订单",
                 "product_name": order.product_name,
                 "billing_cycle": order.billing_cycle,
+                "resource_type": o_res_type,
+                "resource_name": order.product_name,
             })
 
     # 充值记录
@@ -571,6 +577,8 @@ async def list_transactions(
                 "description": f"{recharge.payment_method}充值",
                 "product_name": None,
                 "billing_cycle": None,
+                "resource_type": None,
+                "resource_name": None,
             })
 
     # 日期过滤
@@ -702,6 +710,7 @@ async def settle_instance_billing(
     user.balance -= amount
 
     fk = {"instance_id": instance.id} if instance_type == "gpu" else {"openclaw_instance_id": instance.id}
+    res_name = getattr(instance, 'name', None) or str(instance.id)[:8]
     record = BillingRecord(
         user_id=user.id,
         amount=amount,
@@ -709,7 +718,9 @@ async def settle_instance_billing(
         duration_seconds=duration,
         period_start=instance.last_billed_at,
         period_end=now,
-        description=reason,
+        description=f"{res_name} {reason}",
+        instance_name=res_name,
+        resource_type=instance_type,
         **fk,
     )
     db.add(record)

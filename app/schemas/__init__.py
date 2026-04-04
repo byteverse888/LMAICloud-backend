@@ -43,6 +43,7 @@ class UserResponse(BaseModel):
     last_checkin_date: Optional[str] = None  # 最后签到日期 YYYY-MM-DD
     status: str
     verified: bool = False
+    instance_quota: int = 20  # 实例配额(容器+OpenClaw总数上限)
     created_at: datetime
     updated_at: datetime
 
@@ -413,6 +414,13 @@ class OpenClawInstanceCreate(BaseModel):
     disk_gb: int = 20
     image_url: Optional[str] = None  # 空则使用默认 OpenClaw 镜像
     port: int = 18789
+    # 计费
+    billing_type: str = "hourly"  # hourly/monthly/yearly
+    duration_months: Optional[int] = None  # 包月时长（1/3/6/12）
+    # 创建时批量配置
+    model_keys: Optional[List["ModelKeyCreate"]] = None
+    channels: Optional[List["ChannelCreate"]] = None
+    skills: Optional[List["SkillInstall"]] = None
 
 
 class OpenClawInstanceResponse(BaseModel):
@@ -428,6 +436,10 @@ class OpenClawInstanceResponse(BaseModel):
     disk_gb: int = 20
     image_url: Optional[str] = None
     port: int = 18789
+    # 计费
+    billing_type: Optional[str] = "hourly"
+    hourly_price: Optional[float] = 0.12
+    expired_at: Optional[datetime] = None
     deployment_name: Optional[str] = None
     service_name: Optional[str] = None
     internal_ip: Optional[str] = None

@@ -94,15 +94,28 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         if instance_type == "openclaw":
             result = await session.execute(select(OpenClawInstance).where(OpenClawInstance.id == instance_id))
             instance = result.scalar_one_or_none()
-            if not instance or instance.status != "running":
-                return {"status": "skipped", "reason": "instance not running"}
+            if not instance:
+                return {"status": "skipped", "reason": "instance not found"}
             hourly_price = getattr(instance, "hourly_price", None)
             if hourly_price is None:
                 from app.config import settings
                 hourly_price = settings.default_gpu_hourly_price
-            billing_cycle = getattr(instance, "billing_cycle", "hourly") or "hourly"
+            bt = getattr(instance, "billing_type", None)
+            billing_cycle = bt.value if bt and hasattr(bt, 'value') else (bt or "hourly")
             inst_user_id = instance.user_id
             fk_kwargs = {"openclaw_instance_id": instance.id}
+            res_name = getattr(instance, "name", None) or str(instance.id)[:8]
+            res_type = "openclaw"
+
+            # 状态检查：区分计费类型
+            if billing_cycle in ("monthly", "yearly"):
+                # 包月/包年：只要不是 released/releasing 就检查续费
+                if instance.status in ("released", "releasing"):
+                    return {"status": "skipped", "reason": "instance released"}
+            else:
+                # 按量计费：必须 RUNNING 才计费
+                if instance.status != "running":
+                    return {"status": "skipped", "reason": "instance not running"}
         else:
             result = await session.execute(select(Instance).where(Instance.id == instance_id))
             instance = result.scalar_one_or_none()
@@ -112,6 +125,8 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
             billing_cycle = getattr(instance, "billing_cycle", None) or instance.billing_type or "hourly"
             inst_user_id = instance.user_id
             fk_kwargs = {"instance_id": instance.id}
+            res_name = getattr(instance, "name", None) or str(instance.id)[:8]
+            res_type = "gpu"
 
             # 状态检查：区分计费类型
             if billing_cycle in ("monthly", "yearly"):
@@ -157,9 +172,9 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 amount=-renew_price,
                 status=OrderStatus.PAID,
                 paid_at=datetime.utcnow(),
-                product_name=f"{instance_type} 实例续费",
+                product_name=f"{res_name} ({instance_type}实例续费)",
                 billing_cycle=billing_cycle,
-                description="{}自动续费".format('包月' if billing_cycle == 'monthly' else '包年'),
+                description="{} {} 自动续费".format(res_name, '包月' if billing_cycle == 'monthly' else '包年'),
                 **fk_kwargs,
             )
             session.add(order)
@@ -201,7 +216,9 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
             duration_seconds=duration,
             period_start=last_billed,
             period_end=now,
-            description=f"按量计费",
+            description=f"{res_name} 按量计费",
+            instance_name=res_name,
+            resource_type=res_type,
             **fk_kwargs,
         )
         session.add(record)
@@ -290,9 +307,11 @@ async def process_all_billing_task(ctx: dict) -> dict:
                 print(f"[BILLING] Error processing GPU {instance.id}: {e}")
                 errors += 1
 
-        # OpenClaw 实例
+        # OpenClaw 实例（支持包月/包年）
         oc_result = await session.execute(
-            select(OpenClawInstance).where(OpenClawInstance.status == "running")
+            select(OpenClawInstance).where(
+                OpenClawInstance.status.in_(["running", "stopped", "expired"])
+            )
         )
         for inst in oc_result.scalars().all():
             try:
@@ -672,8 +691,11 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                         if new_status == "running":
                             if not inst.started_at:
                                 inst.started_at = datetime.utcnow()
-                            # 进入 RUNNING 即开始计费（包括重启后）
-                            inst.last_billed_at = datetime.utcnow()
+                            # 进入 RUNNING 开始计费（仅按量计费实例，包月/包年走 expired_at 机制）
+                            bt = getattr(inst, 'billing_type', None)
+                            bt_val = bt.value if bt and hasattr(bt, 'value') else (bt or 'hourly')
+                            if bt_val not in ('monthly', 'yearly'):
+                                inst.last_billed_at = datetime.utcnow()
                         synced += 1
 
                         # Redis pub/sub 通知

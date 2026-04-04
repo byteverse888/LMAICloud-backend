@@ -566,6 +566,43 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     ("10. BillingType 枚举补全 yearly", [
         "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'yearly'",
     ]),
+
+    # ── 11. OpenClaw 实例计费字段 ─────────────────────────
+    ("11. OpenClaw 实例计费字段 (billing_type/hourly_price/expired_at)", [
+        # 直接使用 VARCHAR(20) 避免 billingtype 枚举值大小写不匹配问题
+        "ALTER TABLE openclaw_instances ADD COLUMN IF NOT EXISTS billing_type VARCHAR(20) DEFAULT 'hourly'",
+
+        "ALTER TABLE openclaw_instances ADD COLUMN IF NOT EXISTS hourly_price FLOAT DEFAULT 0.12",
+
+        "ALTER TABLE openclaw_instances ADD COLUMN IF NOT EXISTS expired_at TIMESTAMP",
+
+        "UPDATE openclaw_instances SET billing_type = 'hourly' WHERE billing_type IS NULL",
+        "UPDATE openclaw_instances SET hourly_price = 0.12 WHERE hourly_price IS NULL",
+    ]),
+
+    # ── 12. billing_records 增加计费对象字段 ─────────────────────
+    ("12. billing_records 增加计费对象字段 (instance_name/resource_type)", [
+        "ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS instance_name VARCHAR(100)",
+        "ALTER TABLE billing_records ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20)",
+
+        # 回填历史数据：关联实例名称
+        """UPDATE billing_records br SET resource_type = 'gpu', instance_name = i.name
+           FROM instances i WHERE br.instance_id = i.id AND br.resource_type IS NULL""",
+        """UPDATE billing_records br SET resource_type = 'openclaw', instance_name = oc.name
+           FROM openclaw_instances oc WHERE br.openclaw_instance_id = oc.id AND br.resource_type IS NULL""",
+
+        # 实例已删除的历史记录：根据外键补填类型，名称缺省
+        """UPDATE billing_records SET resource_type = 'gpu', instance_name = '已释放实例'
+           WHERE instance_id IS NOT NULL AND resource_type IS NULL""",
+        """UPDATE billing_records SET resource_type = 'openclaw', instance_name = '已释放实例'
+           WHERE openclaw_instance_id IS NOT NULL AND resource_type IS NULL""",
+    ]),
+
+    # ── 13. ai_users 增加实例配额字段 ─────────────────────────
+    ("13. ai_users 增加 instance_quota 字段", [
+        "ALTER TABLE ai_users ADD COLUMN IF NOT EXISTS instance_quota INTEGER DEFAULT 20",
+        "UPDATE ai_users SET instance_quota = 20 WHERE instance_quota IS NULL",
+    ]),
 ]
 
 
@@ -591,11 +628,15 @@ async def run_migrations():
 
             for sql in sqls:
                 short = sql.strip().split("\n")[0][:72]
+                # 使用 SAVEPOINT 隔离每条 SQL，避免单条失败毒化整个事务
+                sp = await conn.begin_nested()
                 try:
                     await conn.execute(text(sql))
+                    await sp.commit()
                     print(f"    ✓ {short}")
                     success_count += 1
                 except Exception as e:
+                    await sp.rollback()
                     err_msg = str(e).lower()
                     # 常见幂等错误：已存在 / 重复 / 找不到列
                     if any(kw in err_msg for kw in (
