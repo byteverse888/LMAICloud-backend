@@ -10,6 +10,7 @@ import time
 import json
 import base64
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
@@ -27,6 +28,7 @@ from app.services.ws_manager import broadcast_billing_update
 from app.config import settings
 from app.api.v1.points import add_points
 from app.models import PointType
+from fastapi.responses import Response
 
 router = APIRouter()
 logger = logging.getLogger("lmaicloud.billing")
@@ -40,70 +42,81 @@ def generate_order_id() -> str:
 
 
 def _is_wechat_configured() -> bool:
-    """检查微信支付是否已配置"""
-    return bool(settings.wechat_mch_id and settings.wechat_app_id)
+    """检查微信支付是否已配置且非测试模式"""
+    return bool(
+        not settings.wechat_test_mode
+        and settings.wechat_mch_id
+        and settings.wechat_app_id
+        and settings.wechat_api_key
+    )
+
+
+# ── 微信支付 V2 工具函数 ──
+
+def _wechat_sign(params: dict, api_key: str) -> str:
+    """微信支付 V2 MD5 签名"""
+    sorted_items = sorted((k, v) for k, v in params.items() if v and k != "sign")
+    sign_str = "&".join(f"{k}={v}" for k, v in sorted_items)
+    sign_str += f"&key={api_key}"
+    return hashlib.md5(sign_str.encode("utf-8")).hexdigest().upper()
+
+
+def _dict_to_xml(data: dict) -> str:
+    """dict -> XML string"""
+    parts = ["<xml>"]
+    for k, v in data.items():
+        parts.append(f"<{k}><![CDATA[{v}]]></{k}>")
+    parts.append("</xml>")
+    return "".join(parts)
+
+
+def _xml_to_dict(xml_str: str) -> dict:
+    """XML string -> dict"""
+    root = ET.fromstring(xml_str)
+    return {child.tag: (child.text or "") for child in root}
 
 
 async def _create_wechat_native_order(order_id: str, amount: float, description: str) -> dict:
     """
-    调用微信支付 V3 Native 下单 API
-    返回 {"code_url": "weixin://...", ...} 或抛出异常
+    调用微信支付 V2 统一下单 API（Native 扫码支付）
+    返回 {"code_url": "weixin://..."} 或抛出异常
     """
     import httpx
-    import secrets
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import padding
 
-    url = "https://api.mch.weixin.qq.com/v3/pay/transactions/native"
-    nonce = secrets.token_hex(16)
-    timestamp = str(int(time.time()))
+    url = "https://api.mch.weixin.qq.com/pay/unifiedorder"
+    nonce = uuid.uuid4().hex[:32]
 
-    body = {
+    params = {
         "appid": settings.wechat_app_id,
-        "mchid": settings.wechat_mch_id,
-        "description": description,
+        "mch_id": settings.wechat_mch_id,
+        "nonce_str": nonce,
+        "body": description,
         "out_trade_no": order_id,
+        "total_fee": str(int(amount * 100)),  # 单位: 分
+        "spbill_create_ip": "127.0.0.1",
         "notify_url": settings.wechat_notify_url,
-        "amount": {
-            "total": int(amount * 100),  # 分
-            "currency": "CNY",
-        },
+        "trade_type": "NATIVE",
     }
-    body_str = json.dumps(body, ensure_ascii=False)
+    params["sign"] = _wechat_sign(params, settings.wechat_api_key)
 
-    # 构建签名串
-    sign_str = f"POST\n/v3/pay/transactions/native\n{timestamp}\n{nonce}\n{body_str}\n"
-
-    # 用商户私钥签名
-    with open(settings.wechat_private_key_path, "rb") as f:
-        private_key = serialization.load_pem_private_key(f.read(), password=None)
-
-    signature = base64.b64encode(
-        private_key.sign(sign_str.encode(), padding.PKCS1v15(), hashes.SHA256())
-    ).decode()
-
-    auth_header = (
-        f'WECHATPAY2-SHA256-RSA2048 '
-        f'mchid="{settings.wechat_mch_id}",'
-        f'nonce_str="{nonce}",'
-        f'signature="{signature}",'
-        f'timestamp="{timestamp}",'
-        f'serial_no="{settings.wechat_cert_serial_no}"'
-    )
-
+    xml_body = _dict_to_xml(params)
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             url,
-            content=body_str,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": auth_header,
-            },
+            content=xml_body.encode("utf-8"),
+            headers={"Content-Type": "application/xml"},
             timeout=10,
         )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"微信支付下单失败: {resp.text}")
-        return resp.json()
+        result = _xml_to_dict(resp.text)
+
+    if result.get("return_code") != "SUCCESS":
+        err = result.get("return_msg", "unknown")
+        raise HTTPException(status_code=502, detail=f"微信支付通信失败: {err}")
+    if result.get("result_code") != "SUCCESS":
+        err = result.get("err_code_des") or result.get("err_code", "unknown")
+        raise HTTPException(status_code=502, detail=f"微信支付下单失败: {err}")
+
+    return {"code_url": result.get("code_url", "")}
 
 
 @router.get("/orders", response_model=PaginatedResponse, summary="获取订单列表")
@@ -154,7 +167,8 @@ async def get_balance(
     return {
         "balance": current_user.balance,
         "frozen_balance": current_user.frozen_balance,
-        "available": current_user.balance - current_user.frozen_balance
+        "available": current_user.balance - current_user.frozen_balance,
+        "wechat_test_mode": settings.wechat_test_mode,
     }
 
 
@@ -183,8 +197,9 @@ async def create_payment(
     db: AsyncSession = Depends(get_db)
 ):
     """创建支付订单，返回支付二维码URL"""
-    if payment_data.amount < 1:
-        raise HTTPException(status_code=400, detail="Minimum recharge amount is ¥1")
+    min_amount = 0.01 if settings.wechat_test_mode else 1
+    if payment_data.amount < min_amount:
+        raise HTTPException(status_code=400, detail=f"最低充值金额为 ¥{min_amount}")
     if payment_data.amount > 50000:
         raise HTTPException(status_code=400, detail="Maximum recharge amount is ¥50000")
 
@@ -238,7 +253,8 @@ async def create_payment(
         "qr_code_url": qr_url,
         "pay_url": pay_url,
         "expire_time": (datetime.utcnow() + timedelta(minutes=30)).isoformat(),
-        "status": "pending"
+        "status": "pending",
+        "mock_available": settings.wechat_test_mode,
     }
 
 
@@ -272,46 +288,34 @@ async def wechat_callback(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db)
 ):
-    """微信支付 V3 回调（含签名验证 + 金额校验 + 幂等处理）"""
+    """微信支付 V2 回调（XML格式 + MD5签名验证 + 金额校验 + 幂等处理）"""
     body = await request.body()
+    xml_ok = _dict_to_xml({"return_code": "SUCCESS", "return_msg": "OK"})
+    xml_fail = lambda msg: _dict_to_xml({"return_code": "FAIL", "return_msg": msg})
 
     try:
-        data = json.loads(body)
+        data = _xml_to_dict(body.decode("utf-8"))
     except Exception:
-        return {"code": "FAIL", "message": "invalid body"}
-
-    # ── 解密通知体 ──
-    resource = data.get("resource", {})
-    if settings.wechat_api_v3_key and resource.get("ciphertext"):
+        # 兼容 Mock JSON 回调
         try:
-            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-            key = settings.wechat_api_v3_key.encode("utf-8")
-            nonce = resource["nonce"].encode("utf-8")
-            associated_data = (resource.get("associated_data") or "").encode("utf-8")
-            ciphertext = base64.b64decode(resource["ciphertext"])
-            aesgcm = AESGCM(key)
-            plaintext = aesgcm.decrypt(nonce, ciphertext, associated_data)
-            pay_data = json.loads(plaintext)
-        except Exception as e:
-            logger.error(f"微信回调解密失败: {e}")
-            return {"code": "FAIL", "message": f"decrypt error: {e}"}
-    else:
-        # Mock 模式
-        pay_data = resource if resource else data
-        if not pay_data.get("out_trade_no"):
-            pay_data = {
-                "trade_state": "SUCCESS",
-                "out_trade_no": data.get("out_trade_no", ""),
-                "transaction_id": data.get("transaction_id", ""),
-                "amount": data.get("amount", {}),
-            }
+            data = json.loads(body)
+        except Exception:
+            return Response(content=xml_fail("invalid body"), media_type="application/xml")
 
-    if pay_data.get("trade_state") != "SUCCESS":
-        return {"code": "SUCCESS", "message": "OK"}
+    # V2 签名验证
+    if settings.wechat_api_key and data.get("sign"):
+        received_sign = data.get("sign", "")
+        expected_sign = _wechat_sign(data, settings.wechat_api_key)
+        if received_sign != expected_sign:
+            logger.warning(f"微信回调签名验证失败: order={data.get('out_trade_no')}")
+            return Response(content=xml_fail("sign error"), media_type="application/xml")
 
-    order_id = pay_data.get("out_trade_no")
+    if data.get("result_code") != "SUCCESS":
+        return Response(content=xml_ok, media_type="application/xml")
+
+    order_id = data.get("out_trade_no")
     if not order_id:
-        return {"code": "FAIL", "message": "missing out_trade_no"}
+        return Response(content=xml_fail("missing out_trade_no"), media_type="application/xml")
 
     result = await db.execute(
         select(Recharge).where(Recharge.transaction_id == order_id)
@@ -319,23 +323,22 @@ async def wechat_callback(
     recharge = result.scalar_one_or_none()
     if not recharge:
         logger.warning(f"微信回调: 订单不存在 {order_id}")
-        return {"code": "SUCCESS", "message": "OK"}
+        return Response(content=xml_ok, media_type="application/xml")
 
     # 幂等：已处理过的订单直接返回成功
     if recharge.status != RechargeStatus.PENDING:
         logger.info(f"微信回调: 订单已处理 {order_id}, status={recharge.status}")
-        return {"code": "SUCCESS", "message": "OK"}
+        return Response(content=xml_ok, media_type="application/xml")
 
-    # 金额校验（微信返回单位是分）
-    callback_amount = pay_data.get("amount", {})
-    if isinstance(callback_amount, dict):
-        callback_total_fen = callback_amount.get("total", 0)
-    else:
+    # 金额校验（V2 回调 total_fee 单位是分）
+    try:
+        callback_total_fen = int(data.get("total_fee", 0))
+    except (ValueError, TypeError):
         callback_total_fen = 0
     expected_fen = int(recharge.amount * 100)
     if callback_total_fen > 0 and callback_total_fen != expected_fen:
         logger.error(f"微信回调金额不匹配: 订单{order_id}, 期望{expected_fen}分, 实际{callback_total_fen}分")
-        return {"code": "FAIL", "message": "amount mismatch"}
+        return Response(content=xml_fail("amount mismatch"), media_type="application/xml")
 
     # 更新充值状态
     recharge.status = RechargeStatus.SUCCESS
@@ -351,7 +354,7 @@ async def wechat_callback(
     await db.commit()
     logger.info(f"微信支付成功: 订单{order_id}, 金额{recharge.amount}")
 
-    return {"code": "SUCCESS", "message": "OK"}
+    return Response(content=xml_ok, media_type="application/xml")
 
 
 @router.post("/pay/callback/alipay")
@@ -421,8 +424,8 @@ async def mock_payment_success(
     db: AsyncSession = Depends(get_db)
 ):
     """模拟支付成功 (仅用于开发测试)"""
-    if settings.app_env not in ("development", "dev", "test"):
-        raise HTTPException(status_code=403, detail="Mock payment only available in dev/test")
+    if not settings.wechat_test_mode:
+        raise HTTPException(status_code=403, detail="当前为真实支付模式，不允许模拟支付")
 
     result = await db.execute(
         select(Recharge).where(

@@ -7,6 +7,7 @@ Kubernetes 客户端服务
 import os
 import time
 import functools
+import logging
 from typing import Optional, List, Dict, Any
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -14,34 +15,60 @@ from kubernetes.stream import stream as k8s_stream
 
 from app.config import settings
 
+logger = logging.getLogger("lmaicloud.k8s")
+
 
 def _k8s_retry(max_retries: int = 2, delay: float = 1.0):
     """K8s API 调用重试装饰器，遇到连接级错误时重建客户端并重试"""
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
+            # 断路器检查：冷却期内直接拒绝调用
+            if self._circuit_open:
+                elapsed = time.time() - self._last_failure_time
+                if elapsed < self._circuit_cooldown:
+                    raise ConnectionError(
+                        f"K8s circuit breaker OPEN, retry in {int(self._circuit_cooldown - elapsed)}s"
+                    )
+                # 冷却期已过，尝试半开状态
+                logger.info("[K8s] Circuit breaker half-open, probing...")
+
             last_error = None
             for attempt in range(max_retries + 1):
                 try:
-                    return func(self, *args, **kwargs)
+                    result = func(self, *args, **kwargs)
+                    # 调用成功，重置断路器
+                    if self._circuit_open:
+                        logger.info("[K8s] Connection restored, circuit breaker CLOSED")
+                        self._circuit_open = False
+                        self._consecutive_failures = 0
+                    return result
                 except ApiException as e:
-                    # status=0 + Handshake/Connection 是连接级错误，需要重试
                     if e.status == 0 and attempt < max_retries:
                         last_error = e
-                        print(f"[K8s] {func.__name__} attempt {attempt+1} connection error: {str(e)[:120]}, rebuilding...")
+                        logger.debug(f"[K8s] {func.__name__} attempt {attempt+1} connection error, rebuilding...")
                         self._rebuild_client()
                         time.sleep(delay)
                         continue
-                    raise  # 正常 API 错误（404/403 等）不重试
+                    raise
                 except Exception as e:
                     last_error = e
                     err_msg = str(e)
                     if attempt < max_retries and ("Handshake" in err_msg or "Connection" in err_msg or "Timeout" in err_msg):
-                        print(f"[K8s] {func.__name__} attempt {attempt+1} failed: {err_msg[:120]}, rebuilding...")
+                        logger.debug(f"[K8s] {func.__name__} attempt {attempt+1} failed, rebuilding...")
                         self._rebuild_client()
                         time.sleep(delay)
                     else:
                         raise
+            # 所有重试均失败，累加断路器计数
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._circuit_threshold:
+                self._circuit_open = True
+                self._last_failure_time = time.time()
+                logger.warning(
+                    f"[K8s] Circuit breaker OPEN after {self._consecutive_failures} consecutive failures, "
+                    f"cooldown {self._circuit_cooldown}s"
+                )
             raise last_error  # type: ignore
         return wrapper
     return decorator
@@ -62,6 +89,12 @@ class K8sClient:
         self._context = context
         self._initialized = False
         self._api_client = None
+        # 断路器状态
+        self._circuit_open = False
+        self._consecutive_failures = 0
+        self._circuit_threshold = 3       # 连续失败3次后断开
+        self._circuit_cooldown = 120      # 冷却期120秒
+        self._last_failure_time = 0.0
         self._load_config()
         self._create_api_objects()
 
@@ -95,9 +128,17 @@ class K8sClient:
 
     def _rebuild_client(self):
         """重建 K8s API 客户端（连接级错误后调用）"""
-        print("[K8s] Rebuilding API client with fresh connection pool...")
+        logger.debug("[K8s] Rebuilding API client with fresh connection pool...")
         self._load_config()
         self._create_api_objects()
+
+    @property
+    def circuit_open(self) -> bool:
+        """断路器是否开启（K8s 不可达）"""
+        if not self._circuit_open:
+            return False
+        elapsed = time.time() - self._last_failure_time
+        return elapsed < self._circuit_cooldown
     
     @property
     def is_connected(self) -> bool:

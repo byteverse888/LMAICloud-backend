@@ -73,12 +73,12 @@ async def send_email_task(ctx: dict, to_email: str, subject: str, content: str) 
     }
 
 
-async def process_instance_billing_task(ctx: dict, instance_id: str, instance_type: str = "gpu") -> dict:
+async def process_instance_billing_task(ctx: dict, instance_id: str, instance_type: str = "gpu", billing_interval_minutes: int = 60) -> dict:
     """
     处理单个实例计费任务
 
     支持按量（hourly）和包月/包年计费：
-    - hourly: 每小时扣费
+    - hourly: 按配置的间隔周期扣费，金额 = hourly_price * (interval / 60)
     - monthly/yearly: 到期后自动续费或停机
     """
     from app.database import AsyncSessionLocal
@@ -87,7 +87,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
 
-    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id}")
+    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id} (interval={billing_interval_minutes}min)")
 
     async with AsyncSessionLocal() as session:
         # 根据类型获取实例
@@ -98,7 +98,6 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 return {"status": "skipped", "reason": "instance not running"}
             hourly_price = getattr(instance, "hourly_price", None)
             if hourly_price is None:
-                # OpenClaw 默认价格：按 CPU/内存/磁盘 估算
                 from app.config import settings
                 hourly_price = settings.default_gpu_hourly_price
             billing_cycle = getattr(instance, "billing_cycle", "hourly") or "hourly"
@@ -124,24 +123,20 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         if billing_cycle in ("monthly", "yearly"):
             expired_at = getattr(instance, "expired_at", None)
             if expired_at and datetime.utcnow() < expired_at:
-                # 尚未到期，跳过
                 return {"status": "skipped", "reason": "subscription active"}
 
-            # 到期了，尝试自动续费
             if billing_cycle == "monthly":
-                renew_price = hourly_price * 24 * 30  # 月费 = 时价 * 720h
+                renew_price = hourly_price * 24 * 30
                 delta = relativedelta(months=1)
             else:
-                renew_price = hourly_price * 24 * 365  # 年费
+                renew_price = hourly_price * 24 * 365
                 delta = relativedelta(years=1)
 
             if user.balance < renew_price:
-                # 余额不足，停机
                 instance.status = InstanceStatus.EXPIRED
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low for renewal"}
 
-            # 扣费续期
             user.balance -= renew_price
             new_start = expired_at or datetime.utcnow()
             instance.expired_at = new_start + delta
@@ -167,23 +162,27 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 "next_expire": instance.expired_at.isoformat(),
             }
 
-        # 按量（hourly）扣费
-        if user.balance < hourly_price:
-            print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {hourly_price}")
+        # 按量扣费：金额 = hourly_price * (billing_interval_minutes / 60)
+        charge_amount = round(hourly_price * (billing_interval_minutes / 60), 4)
+
+        if user.balance < charge_amount:
+            print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {charge_amount}")
             if user.balance < -10:
                 instance.status = InstanceStatus.EXPIRED
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low"}
 
-        user.balance -= hourly_price
+        user.balance -= charge_amount
+        interval_desc = f"{billing_interval_minutes}分钟" if billing_interval_minutes < 60 else f"{billing_interval_minutes // 60}小时"
         order = Order(
             user_id=user.id,
             type=OrderType.RENEW,
-            amount=-hourly_price,
+            amount=-charge_amount,
             status=OrderStatus.PAID,
             paid_at=datetime.utcnow(),
             product_name=f"{instance_type} 实例按量计费",
             billing_cycle="hourly",
+            description=f"按量计费({interval_desc})",
             **order_kwargs,
         )
         session.add(order)
@@ -192,7 +191,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         return {
             "status": "processed",
             "instance_id": instance_id,
-            "amount": hourly_price,
+            "amount": charge_amount,
             "new_balance": user.balance,
             "processed_at": datetime.utcnow().isoformat(),
         }
@@ -201,13 +200,50 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
 async def process_all_billing_task(ctx: dict) -> dict:
     """
     定时任务: 处理所有运行中实例的计费（GPU + OpenClaw）
+
+    该任务每5分钟触发，内部根据 billing_interval_minutes 配置
+    判断是否真正执行计费（通过 last_billing_run_at 标记上次执行时间）。
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance, OpenClawInstance
+    from app.models import Instance, OpenClawInstance, SystemSetting
     from app.models import InstanceStatus as _IS
     from sqlalchemy import select
+    import json
 
-    print(f"[BILLING] Processing all instance billing...")
+    # ---- 读取计费间隔配置 ----
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(SystemSetting).where(SystemSetting.key == "billing_interval_minutes")
+        )
+        setting = result.scalar_one_or_none()
+        billing_interval = json.loads(setting.value) if setting else 60
+
+        # 读取上次执行时间
+        result = await session.execute(
+            select(SystemSetting).where(SystemSetting.key == "last_billing_run_at")
+        )
+        last_run_setting = result.scalar_one_or_none()
+        last_run_at = None
+        if last_run_setting:
+            try:
+                last_run_at = datetime.fromisoformat(json.loads(last_run_setting.value))
+            except Exception:
+                pass
+
+        # 判断是否达到计费间隔
+        now = datetime.utcnow()
+        if last_run_at and (now - last_run_at).total_seconds() < (billing_interval * 60 - 30):
+            # 未到间隔时间（减30秒容差），跳过
+            return {"status": "skipped", "reason": f"interval not reached ({billing_interval}min)"}
+
+        # 更新上次执行时间
+        if last_run_setting:
+            last_run_setting.value = json.dumps(now.isoformat())
+        else:
+            session.add(SystemSetting(key="last_billing_run_at", value=json.dumps(now.isoformat()), description="上次计费执行时间"))
+        await session.commit()
+
+    print(f"[BILLING] Processing all instance billing (interval={billing_interval}min)...")
 
     processed = 0
     errors = 0
@@ -219,7 +255,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
         )
         for instance in result.scalars().all():
             try:
-                r = await process_instance_billing_task(ctx, str(instance.id), "gpu")
+                r = await process_instance_billing_task(ctx, str(instance.id), "gpu", billing_interval)
                 if r.get("status") in ("processed", "renewed"):
                     processed += 1
             except Exception as e:
@@ -232,7 +268,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
         )
         for inst in oc_result.scalars().all():
             try:
-                r = await process_instance_billing_task(ctx, str(inst.id), "openclaw")
+                r = await process_instance_billing_task(ctx, str(inst.id), "openclaw", billing_interval)
                 if r.get("status") in ("processed", "renewed"):
                     processed += 1
             except Exception as e:
@@ -241,9 +277,10 @@ async def process_all_billing_task(ctx: dict) -> dict:
 
     return {
         "status": "completed",
+        "billing_interval_minutes": billing_interval,
         "processed": processed,
         "errors": errors,
-        "processed_at": datetime.utcnow().isoformat(),
+        "processed_at": now.isoformat(),
     }
 
 
@@ -301,6 +338,10 @@ async def sync_instance_status_task(ctx: dict) -> dict:
             k8s = get_k8s_client()
             if not k8s.is_connected:
                 return {"status": "skipped", "reason": "k8s not connected"}
+
+            # 断路器开启时跳过，避免无效重试和日志轰炸
+            if k8s.circuit_open:
+                return {"status": "skipped", "reason": "k8s circuit breaker open"}
 
             # 批量获取所有 Deployment（跨命名空间）
             deployments = k8s.list_deployments(
@@ -754,8 +795,8 @@ class WorkerSettings:
     cron_jobs = [
         # 每30秒同步实例状态（K8s → DB）
         cron(sync_instance_status_task, second={0, 30}, unique=True, timeout=25),
-        # 每小时整点计费
-        cron(process_all_billing_task, minute=0),
+        # 每5分钟检查计费（实际间隔由 billing_interval_minutes 配置控制）
+        cron(process_all_billing_task, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}),
         # 每小时清理过期实例
         cron(cleanup_expired_instances_task, minute=5),
         # 每天凌晨2点生成报表

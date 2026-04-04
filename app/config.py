@@ -65,14 +65,12 @@ class Settings(BaseSettings):
     # 邮箱激活令牌过期时间（小时）
     email_activation_expire_hours: int = 24
     
-    # 微信支付
+    # 微信支付 (V2)
     wechat_app_id: str = ""
     wechat_mch_id: str = ""
-    wechat_api_key: str = ""
-    wechat_api_v3_key: str = ""
-    wechat_cert_serial_no: str = ""
-    wechat_private_key_path: str = ""
+    wechat_api_key: str = ""  # V2 API密钥
     wechat_notify_url: str = ""
+    wechat_test_mode: bool = True  # True=模拟支付, False=真实微信支付
 
     # OpenClaw
     openclaw_default_port: int = 18789

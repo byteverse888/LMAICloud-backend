@@ -102,6 +102,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_balance": 0.0,
     "min_recharge_amount": 10.0,
     "max_recharge_amount": 100000.0,
+    "billing_interval_minutes": 60,
     "instance_auto_stop_hours": 24,
     "instance_max_per_user": 10,
     "storage_max_gb_per_user": 100,
@@ -145,6 +146,7 @@ class SystemSettingsUpdate(BaseModel):
     default_balance: Optional[float] = None
     min_recharge_amount: Optional[float] = None
     max_recharge_amount: Optional[float] = None
+    billing_interval_minutes: Optional[int] = None
     instance_auto_stop_hours: Optional[int] = None
     instance_max_per_user: Optional[int] = None
     storage_max_gb_per_user: Optional[int] = None

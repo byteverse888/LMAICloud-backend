@@ -1,5 +1,5 @@
 """用户管理 API (管理端)"""
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
 from typing import List, Optional
@@ -7,10 +7,11 @@ from datetime import datetime
 from uuid import UUID
 
 from app.database import get_db
-from app.models import User, UserRole, UserStatus, Instance, Order, InstanceStatus
+from app.models import User, UserRole, UserStatus, Instance, Order, InstanceStatus, AuditAction, AuditResourceType
 from app.schemas import UserResponse, UserCreate
 from app.utils.auth import get_current_admin_user, get_password_hash
 from app.logging_config import get_logger
+from app.api.v1.audit_log import create_audit_log, get_client_ip
 
 router = APIRouter()
 logger = get_logger("lmaicloud.admin.users")
@@ -252,6 +253,7 @@ async def update_user_role(
 @router.delete("/{user_id}")
 async def delete_user(
     user_id: UUID,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_admin_user),
 ):
@@ -282,6 +284,17 @@ async def delete_user(
         user_email = user.email
         await db.delete(user)
         await db.commit()
+        # 记录审计日志
+        try:
+            await create_audit_log(
+                db, current_user.id, AuditAction.DELETE, AuditResourceType.ACCOUNT,
+                resource_id=str(user_id), resource_name=user_email,
+                detail=f"管理端删除用户 {user_email}",
+                ip_address=get_client_ip(request),
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"记录删除用户日志失败: {e}")
         logger.info(f"删除用户成功 - 用户: {user_id}, 邮箱: {user_email}")
         return {"message": "用户已删除"}
     except HTTPException:

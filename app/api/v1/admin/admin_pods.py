@@ -1,12 +1,16 @@
 """管理后台 - 容器(Pod)管理 API"""
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from typing import Optional
 import json
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.utils.auth import get_current_admin_user
 from app.services.k8s_client import get_k8s_client
 from app.logging_config import get_logger
+from app.database import get_db
+from app.api.v1.audit_log import create_audit_log, get_client_ip
+from app.models import AuditAction, AuditResourceType
 
 router = APIRouter()
 logger = get_logger("lmaicloud.admin_pods")
@@ -127,7 +131,9 @@ async def get_pod(
 @router.delete("/{ns}/{name}", summary="删除 Pod")
 async def delete_pod(
     ns: str, name: str,
+    request: Request,
     current_user=Depends(get_current_admin_user),
+    db: AsyncSession = Depends(get_db),
 ):
     k8s = get_k8s_client()
     # 先查询 Pod 状态：若为 Terminating（deletion_timestamp 不为空）则强制删除（grace_period=0）
@@ -136,6 +142,14 @@ async def delete_pod(
     ok = k8s.delete_pod(name, ns, force=is_terminating)
     if not ok:
         raise HTTPException(status_code=400, detail="删除 Pod 失败")
+    detail = f"管理端{'强制' if is_terminating else ''}删除 Pod {ns}/{name}"
+    await create_audit_log(
+        db, current_user.id, AuditAction.DELETE, AuditResourceType.INSTANCE,
+        resource_id=f"{ns}/{name}", resource_name=name,
+        detail=detail,
+        ip_address=get_client_ip(request),
+    )
+    await db.commit()
     return {"message": "删除成功"}
 
 

@@ -246,7 +246,7 @@ async def list_instances(
     if active_instances:
         try:
             k8s = get_k8s_client()
-            if k8s.is_connected:
+            if k8s.is_connected and not k8s.circuit_open:
                 deployments = await asyncio.to_thread(
                     k8s.list_deployments,
                     label_selector="app=gpu-instance",
@@ -333,6 +333,7 @@ async def list_instances(
 @router.post("", summary="创建容器实例")
 async def create_instance(
     instance_data: InstanceCreate,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -444,12 +445,13 @@ async def create_instance(
 
     # 记录审计日志
     try:
-        from app.api.v1.audit_log import create_audit_log
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
         from app.models import AuditAction, AuditResourceType
         await create_audit_log(
             db, current_user.id, AuditAction.CREATE, AuditResourceType.INSTANCE,
             resource_id=str(instance.id), resource_name=instance.name,
             detail=f"GPU:{gpu_count}, 节点:{nd_name}, 镜像:{image_url}",
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -641,6 +643,7 @@ async def get_instance(
 @router.post("/{instance_id}/start")
 async def start_instance(
     instance_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -670,11 +673,12 @@ async def start_instance(
 
     # 记录审计日志
     try:
-        from app.api.v1.audit_log import create_audit_log
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
         from app.models import AuditAction, AuditResourceType
         await create_audit_log(
             db, current_user.id, AuditAction.START, AuditResourceType.INSTANCE,
             resource_id=str(instance.id), resource_name=instance.name,
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -720,6 +724,7 @@ async def start_instance(
 @router.post("/{instance_id}/stop")
 async def stop_instance(
     instance_id: str,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -744,11 +749,12 @@ async def stop_instance(
         await db.commit()
         # 记录审计日志
         try:
-            from app.api.v1.audit_log import create_audit_log
+            from app.api.v1.audit_log import create_audit_log, get_client_ip
             from app.models import AuditAction, AuditResourceType
             await create_audit_log(
                 db, current_user.id, AuditAction.STOP, AuditResourceType.INSTANCE,
                 resource_id=str(instance.id), resource_name=instance.name,
+                ip_address=get_client_ip(request),
             )
             await db.commit()
         except Exception as e:
@@ -765,26 +771,28 @@ async def stop_instance(
 @router.delete("/{instance_id}/force", summary="强制删除实例 - 必须在 DELETE /{instance_id} 之前注册")
 async def force_delete_instance(
     instance_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """强制删除实例：无论当前状态，直接清理 K8s 资源并从 DB 标记为已删除"""
-    return await _do_force_delete(instance_id, current_user, db, background_tasks)
+    return await _do_force_delete(instance_id, current_user, db, background_tasks, request)
 
 
 @router.post("/{instance_id}/force", summary="强制删除实例（POST兼容入口，适配严格反向代理环境）")
 async def force_delete_instance_post(
     instance_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """与 DELETE /{instance_id}/force 完全等价，供不支持 DELETE 的反向代理环境使用"""
-    return await _do_force_delete(instance_id, current_user, db, background_tasks)
+    return await _do_force_delete(instance_id, current_user, db, background_tasks, request)
 
 
-async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSession, background_tasks: BackgroundTasks):
+async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSession, background_tasks: BackgroundTasks, request: Request = None):
     """
     强制删除核心逻辑
 
@@ -810,12 +818,13 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
         logger.info(f"实例 {instance_id} DB 状态已更新为 released, user={current_user.id}")
         # 记录审计日志
         try:
-            from app.api.v1.audit_log import create_audit_log
+            from app.api.v1.audit_log import create_audit_log, get_client_ip
             from app.models import AuditAction, AuditResourceType
             await create_audit_log(
                 db, current_user.id, AuditAction.DELETE, AuditResourceType.INSTANCE,
                 resource_id=str(instance_id), resource_name=inst_name,
                 detail="强制删除",
+                ip_address=get_client_ip(request) if request else None,
             )
             await db.commit()
         except Exception as e:
@@ -842,6 +851,7 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
 @router.delete("/{instance_id}")
 async def release_instance(
     instance_id: str,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
@@ -865,11 +875,12 @@ async def release_instance(
 
     # 记录审计日志
     try:
-        from app.api.v1.audit_log import create_audit_log
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
         from app.models import AuditAction, AuditResourceType
         await create_audit_log(
             db, current_user.id, AuditAction.DELETE, AuditResourceType.INSTANCE,
             resource_id=str(instance.id), resource_name=instance.name,
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
