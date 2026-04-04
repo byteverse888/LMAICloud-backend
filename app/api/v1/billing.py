@@ -15,10 +15,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, extract, case
+from sqlalchemy import select, func, extract, case, String
 
 from app.database import get_db
-from app.models import User, Order, Recharge, OrderType, OrderStatus, RechargeStatus, PaymentMethod, ResourcePlan
+from app.models import User, Order, Recharge, OrderType, OrderStatus, RechargeStatus, PaymentMethod, ResourcePlan, BillingRecord
 from app.schemas import (
     OrderResponse, RechargeCreate, RechargeResponse, PaginatedResponse,
     PaymentCreate, PaymentResponse, ResourcePlanResponse,
@@ -125,6 +125,10 @@ async def list_orders(
     size: int = 20,
     type: Optional[str] = None,
     status: Optional[str] = None,
+    search: Optional[str] = None,
+    product_name: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
@@ -135,12 +139,34 @@ async def list_orders(
         try:
             query = query.where(Order.type == OrderType(type))
         except ValueError:
-            pass  # 无效类型参数，忽略筛选
+            pass
     if status:
         try:
             query = query.where(Order.status == OrderStatus(status))
         except ValueError:
-            pass  # 无效状态参数，忽略筛选
+            pass
+    if search:
+        # 支持按订单号或描述模糊搜索
+        query = query.where(
+            Order.id.cast(String).ilike(f"%{search}%") |
+            Order.description.ilike(f"%{search}%")
+        )
+    if product_name and product_name != 'all':
+        label_map = {'instance': '容器实例', 'openclaw': 'OpenClaw', 'storage': '存储', 'image': '镜像', 'disk': '扩容'}
+        keyword = label_map.get(product_name, product_name)
+        query = query.where(Order.product_name.ilike(f"%{keyword}%"))
+    if start_date:
+        from datetime import datetime as _dt
+        try:
+            query = query.where(Order.created_at >= _dt.fromisoformat(start_date))
+        except ValueError:
+            pass
+    if end_date:
+        from datetime import datetime as _dt
+        try:
+            query = query.where(Order.created_at <= _dt.fromisoformat(end_date + "T23:59:59"))
+        except ValueError:
+            pass
 
     query = query.order_by(Order.created_at.desc())
 
@@ -471,15 +497,51 @@ async def list_transactions(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """获取交易流水（合并消费+充值）"""
+    """获取交易流水（合并计费流水+订单+充值）"""
     transactions = []
 
-    # 消费订单
+    # ---- 始终查询全量计费流水（用于统计卡片，不受 type 筛选影响）----
+    all_billing_result = await db.execute(
+        select(BillingRecord).where(BillingRecord.user_id == current_user.id).order_by(BillingRecord.created_at.desc())
+    )
+    all_billing_records = all_billing_result.scalars().all()
+
+    # 查询历史订单（CREATE/RENEW 类型，兼容旧数据）
+    all_orders_result = await db.execute(
+        select(Order).where(Order.user_id == current_user.id).order_by(Order.created_at.desc())
+    )
+    all_orders = all_orders_result.scalars().all()
+
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+    month_start = _dt(now.year, now.month, 1).isoformat()
+
+    # 统计消费：billing_records + orders 合并
+    month_consumption = (
+        sum(abs(r.amount) for r in all_billing_records if r.created_at and r.created_at.isoformat() >= month_start)
+        + sum(abs(o.amount) for o in all_orders if o.created_at and o.created_at.isoformat() >= month_start)
+    )
+    total_consumption = (
+        sum(abs(r.amount) for r in all_billing_records)
+        + sum(abs(o.amount) for o in all_orders)
+    )
+
+    # ---- 按 type 筛选构建列表 ----
+    # 消费：billing_records + orders
     if type in (None, "consumption", "order"):
-        orders_result = await db.execute(
-            select(Order).where(Order.user_id == current_user.id).order_by(Order.created_at.desc())
-        )
-        for order in orders_result.scalars().all():
+        for record in all_billing_records:
+            duration_min = record.duration_seconds // 60 if record.duration_seconds else 0
+            transactions.append({
+                "id": str(record.id),
+                "type": "consumption",
+                "amount": -abs(record.amount),
+                "status": "paid",
+                "created_at": record.created_at.isoformat(),
+                "description": record.description or "按量计费",
+                "product_name": None,
+                "billing_cycle": "hourly",
+            })
+        for order in all_orders:
             transactions.append({
                 "id": str(order.id),
                 "type": "consumption",
@@ -526,7 +588,9 @@ async def list_transactions(
         "list": transactions[start:end_idx],
         "total": total,
         "page": page,
-        "size": size
+        "size": size,
+        "month_consumption": round(month_consumption, 2),
+        "total_consumption": round(total_consumption, 2),
     }
 
 
@@ -606,3 +670,48 @@ async def list_plans(
     )
     plans = result.scalars().all()
     return [ResourcePlanResponse.model_validate(p) for p in plans]
+
+
+# ========== 公共结算函数 ==========
+
+async def settle_instance_billing(
+    instance, user, db: AsyncSession,
+    instance_type: str = "gpu",
+    reason: str = "即时结算"
+):
+    """
+    即时结算：计算从 last_billed_at 到现在的实际运行费用。
+    用于停止/删除实例时调用。仅对按量计费(hourly)实例生效。
+    """
+    # 包月/包年实例不执行按量即时结算
+    bt = getattr(instance, 'billing_type', None)
+    if bt and str(bt) in ('monthly', 'yearly'):
+        return None
+
+    if not instance.last_billed_at:
+        return None  # 从未进入 RUNNING / 已结算
+
+    now = datetime.utcnow()
+    duration = int((now - instance.last_billed_at).total_seconds())
+    if duration < 60:  # <1分钟免计费
+        instance.last_billed_at = None
+        return None
+
+    hourly_price = getattr(instance, 'hourly_price', None) or settings.default_gpu_hourly_price
+    amount = round(hourly_price * duration / 3600, 4)
+    user.balance -= amount
+
+    fk = {"instance_id": instance.id} if instance_type == "gpu" else {"openclaw_instance_id": instance.id}
+    record = BillingRecord(
+        user_id=user.id,
+        amount=amount,
+        hourly_price=hourly_price,
+        duration_seconds=duration,
+        period_start=instance.last_billed_at,
+        period_end=now,
+        description=reason,
+        **fk,
+    )
+    db.add(record)
+    instance.last_billed_at = None  # 标记已结算
+    return {"amount": amount, "duration": duration}

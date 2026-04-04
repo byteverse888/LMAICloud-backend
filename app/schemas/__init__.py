@@ -40,6 +40,7 @@ class UserResponse(BaseModel):
     frozen_balance: float
     points: int = 0
     invite_code: Optional[str] = None
+    last_checkin_date: Optional[str] = None  # 最后签到日期 YYYY-MM-DD
     status: str
     verified: bool = False
     created_at: datetime

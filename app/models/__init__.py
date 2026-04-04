@@ -140,6 +140,7 @@ class BillingType(str, enum.Enum):
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
+    YEARLY = "yearly"
 
 
 class AutoShutdownType(str, enum.Enum):
@@ -216,6 +217,7 @@ class Instance(Base):
 
     # 时间
     started_at = Column(DateTime)
+    last_billed_at = Column(DateTime, nullable=True)  # 上次计费时间点
     expired_at = Column(DateTime)
     release_at = Column(DateTime)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -225,6 +227,7 @@ class Instance(Base):
     node = relationship("Node", back_populates="instances")
     image = relationship("Image")
     orders = relationship("Order", back_populates="instance")
+    billing_records = relationship("BillingRecord", back_populates="instance")
 
 
 class ImageType(str, enum.Enum):
@@ -288,6 +291,27 @@ class Order(Base):
 
     ai_user = relationship("AIUser", back_populates="orders")
     instance = relationship("Instance", back_populates="orders")
+
+
+class BillingRecord(Base):
+    """按量计费流水（系统自动生成，与订单分离）"""
+    __tablename__ = "billing_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    instance_id = Column(UUID(as_uuid=True), ForeignKey("instances.id"), nullable=True)
+    openclaw_instance_id = Column(UUID(as_uuid=True), ForeignKey("openclaw_instances.id"), nullable=True)
+
+    amount = Column(Float, nullable=False)            # 扣费金额（正数）
+    hourly_price = Column(Float, nullable=False)      # 当时的小时单价
+    duration_seconds = Column(Integer, nullable=False) # 实际运行秒数
+    period_start = Column(DateTime, nullable=False)    # 计费区间起点
+    period_end = Column(DateTime, nullable=False)      # 计费区间终点
+    description = Column(String(200))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    user = relationship("AIUser")
+    instance = relationship("Instance", back_populates="billing_records")
 
 
 class PaymentMethod(str, enum.Enum):
@@ -477,6 +501,7 @@ class OpenClawInstance(Base):
 
     # 生命周期
     started_at = Column(DateTime)
+    last_billed_at = Column(DateTime, nullable=True)  # 上次计费时间点
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

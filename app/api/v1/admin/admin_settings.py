@@ -102,7 +102,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "default_balance": 0.0,
     "min_recharge_amount": 10.0,
     "max_recharge_amount": 100000.0,
-    "billing_interval_minutes": 60,
+    "billing_interval_minutes": 15,
     "instance_auto_stop_hours": 24,
     "instance_max_per_user": 10,
     "storage_max_gb_per_user": 100,

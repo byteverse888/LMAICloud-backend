@@ -11,6 +11,7 @@
   6. 计费系统升级 (add_billing_upgrade) -- 依赖 openclaw_instances
   7. 平台功能升级 (add_platform_upgrade + platform_upgrade_v2)
   8. 预置种子数据 (resource_plans / market_products / app_images / images)
+  9. 按实际运行时长计费改造 (billing_records + last_billed_at)
 
 用法:
   cd LMAICloud-backend
@@ -529,6 +530,41 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
                 'OFFICIAL', 15.0, 'Jupyter Lab 交互开发环境，含常用科学计算包', true, 'LMAICloud',
                 '["Jupyter", "开发工具", "交互式"]', 'ACTIVE', NOW(), NOW())
            ON CONFLICT DO NOTHING""",
+    ]),
+
+    # ── 9. 按实际运行时长计费改造 ──────────────────────────────
+    ("9. 计费流水表 billing_records", [
+        """CREATE TABLE IF NOT EXISTS billing_records (
+               id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+               user_id UUID NOT NULL REFERENCES ai_users(id),
+               instance_id UUID REFERENCES instances(id),
+               openclaw_instance_id UUID REFERENCES openclaw_instances(id),
+               amount FLOAT NOT NULL,
+               hourly_price FLOAT NOT NULL,
+               duration_seconds INTEGER NOT NULL,
+               period_start TIMESTAMP NOT NULL,
+               period_end TIMESTAMP NOT NULL,
+               description VARCHAR(200),
+               created_at TIMESTAMP DEFAULT NOW()
+           )""",
+
+        "CREATE INDEX IF NOT EXISTS idx_billing_records_user ON billing_records(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_billing_records_instance ON billing_records(instance_id)",
+    ]),
+
+    ("9. Instance/OpenClaw 新增 last_billed_at", [
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS last_billed_at TIMESTAMP",
+        "ALTER TABLE openclaw_instances ADD COLUMN IF NOT EXISTS last_billed_at TIMESTAMP",
+
+        # 对已 RUNNING 的实例初始化 last_billed_at（从迁移时刻开始计费）
+        # status 列是 PostgreSQL 枚举类型，需用 ::text 转换后比较
+        "UPDATE instances SET last_billed_at = NOW() WHERE status::text = 'RUNNING' AND last_billed_at IS NULL",
+        "UPDATE openclaw_instances SET last_billed_at = NOW() WHERE status::text = 'running' AND last_billed_at IS NULL",
+    ]),
+
+    # ── 10. BillingType 枚举补全 YEARLY ─────────────────────────
+    ("10. BillingType 枚举补全 yearly", [
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'yearly'",
     ]),
 ]
 

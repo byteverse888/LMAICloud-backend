@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import (
     AIUser as User, OpenClawInstance, ModelKey, Channel, OpenClawSkill,
+    Order, OrderType, OrderStatus,
 )
 from app.schemas import (
     OpenClawInstanceCreate, OpenClawInstanceResponse, OpenClawSpecUpdate,
@@ -69,6 +70,11 @@ async def create_instance(
     db: AsyncSession = Depends(get_db),
 ):
     """创建 OpenClaw 实例"""
+    # 余额检查：至少够1小时费用
+    min_balance = settings.default_gpu_hourly_price
+    if current_user.balance < min_balance:
+        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+
     user_ns = PodManager.user_namespace(str(current_user.id))
     image = req.image_url or settings.openclaw_default_image
 
@@ -132,6 +138,27 @@ async def create_instance(
         import logging
         logging.getLogger(__name__).warning(f"记录创建OpenClaw日志失败: {e}")
 
+    # 计费说明：创建时不扣费，等实例进入 RUNNING 状态后由定时任务按实际运行时长计费
+
+    # 创建订单记录（不扣费，仅作为订单记录）
+    try:
+        create_order = Order(
+            user_id=current_user.id,
+            openclaw_instance_id=inst.id,
+            type=OrderType.CREATE,
+            amount=0,
+            status=OrderStatus.PAID,
+            paid_at=datetime.utcnow(),
+            product_name="OpenClaw AI Agent",
+            billing_cycle='hourly',
+            description=f"创建 OpenClaw 实例 - {inst.name}",
+        )
+        db.add(create_order)
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"创建订单记录失败: {e}")
+
     return inst
 
 
@@ -169,6 +196,18 @@ async def delete_instance(
 ):
     """删除 OpenClaw 实例（释放所有 K8s 资源）"""
     inst = await _get_instance_or_404(instance_id, current_user, db)
+
+    # 删除前即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        from app.models import AIUser
+        user_result = await db.execute(select(AIUser).where(AIUser.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(inst, user_obj, db, "openclaw", "删除结算")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OpenClaw删除结算失败: {e}")
+
     inst.status = "releasing"
     await db.commit()
 
@@ -209,6 +248,11 @@ async def start_instance(
     if inst.status not in ("stopped", "error"):
         raise HTTPException(status_code=400, detail=f"当前状态 {inst.status} 不可启动")
 
+    # 余额检查：至少够1小时费用
+    min_balance = settings.default_gpu_hourly_price
+    if current_user.balance < min_balance:
+        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+
     mgr = get_openclaw_manager()
     ok = await asyncio.to_thread(mgr.start_instance, str(inst.id), inst.namespace)
     if not ok:
@@ -244,6 +288,17 @@ async def stop_instance(
     inst = await _get_instance_or_404(instance_id, current_user, db)
     if inst.status not in ("running", "error"):
         raise HTTPException(status_code=400, detail=f"当前状态 {inst.status} 不可停止")
+
+    # 停机前即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        from app.models import AIUser
+        user_result = await db.execute(select(AIUser).where(AIUser.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(inst, user_obj, db, "openclaw", "停机结算")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OpenClaw停机结算失败: {e}")
 
     mgr = get_openclaw_manager()
     ok = await asyncio.to_thread(mgr.stop_instance, str(inst.id), inst.namespace)

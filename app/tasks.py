@@ -73,21 +73,21 @@ async def send_email_task(ctx: dict, to_email: str, subject: str, content: str) 
     }
 
 
-async def process_instance_billing_task(ctx: dict, instance_id: str, instance_type: str = "gpu", billing_interval_minutes: int = 60) -> dict:
+async def process_instance_billing_task(ctx: dict, instance_id: str, instance_type: str = "gpu", billing_interval_minutes: int = 15) -> dict:
     """
     处理单个实例计费任务
 
-    支持按量（hourly）和包月/包年计费：
-    - hourly: 按配置的间隔周期扣费，金额 = hourly_price * (interval / 60)
-    - monthly/yearly: 到期后自动续费或停机
+    按实际运行时长计费：
+    - hourly: 费用 = hourly_price * (now - last_billed_at) / 3600，写入 billing_records
+    - monthly/yearly: 到期后自动续费或停机，写入 orders
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus, InstanceStatus
+    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus, InstanceStatus, BillingRecord
     from sqlalchemy import select
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
 
-    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id} (interval={billing_interval_minutes}min)")
+    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id}")
 
     async with AsyncSessionLocal() as session:
         # 根据类型获取实例
@@ -102,7 +102,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 hourly_price = settings.default_gpu_hourly_price
             billing_cycle = getattr(instance, "billing_cycle", "hourly") or "hourly"
             inst_user_id = instance.user_id
-            order_kwargs = {"openclaw_instance_id": instance.id}
+            fk_kwargs = {"openclaw_instance_id": instance.id}
         else:
             result = await session.execute(select(Instance).where(Instance.id == instance_id))
             instance = result.scalar_one_or_none()
@@ -111,7 +111,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
             hourly_price = instance.hourly_price
             billing_cycle = getattr(instance, "billing_cycle", None) or instance.billing_type or "hourly"
             inst_user_id = instance.user_id
-            order_kwargs = {"instance_id": instance.id}
+            fk_kwargs = {"instance_id": instance.id}
 
         # 获取用户
         result = await session.execute(select(User).where(User.id == inst_user_id))
@@ -119,7 +119,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         if not user:
             return {"status": "error", "reason": "user not found"}
 
-        # 包月/包年计费逻辑
+        # 包月/包年计费逻辑（仍写入 Order）
         if billing_cycle in ("monthly", "yearly"):
             expired_at = getattr(instance, "expired_at", None)
             if expired_at and datetime.utcnow() < expired_at:
@@ -149,8 +149,8 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 paid_at=datetime.utcnow(),
                 product_name=f"{instance_type} 实例续费",
                 billing_cycle=billing_cycle,
-                description=f"{'包月' if billing_cycle == 'monthly' else '包年'}自动续费",
-                **order_kwargs,
+                description="{}自动续费".format('包月' if billing_cycle == 'monthly' else '包年'),
+                **fk_kwargs,
             )
             session.add(order)
             await session.commit()
@@ -162,38 +162,49 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 "next_expire": instance.expired_at.isoformat(),
             }
 
-        # 按量扣费：金额 = hourly_price * (billing_interval_minutes / 60)
-        charge_amount = round(hourly_price * (billing_interval_minutes / 60), 4)
+        # 按量计费：按实际运行时长，写入 billing_records
+        last_billed = instance.last_billed_at
+        if not last_billed:
+            return {"status": "skipped", "reason": "last_billed_at not set (not running or already settled)"}
 
+        now = datetime.utcnow()
+        duration = int((now - last_billed).total_seconds())
+        if duration < 60:
+            return {"status": "skipped", "reason": "duration too short"}
+
+        charge_amount = round(hourly_price * duration / 3600, 4)
+
+        # 余额不足检查
         if user.balance < charge_amount:
             print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {charge_amount}")
             if user.balance < -10:
                 instance.status = InstanceStatus.EXPIRED
+                instance.last_billed_at = None
                 await session.commit()
                 return {"status": "expired", "reason": "balance too low"}
 
         user.balance -= charge_amount
-        interval_desc = f"{billing_interval_minutes}分钟" if billing_interval_minutes < 60 else f"{billing_interval_minutes // 60}小时"
-        order = Order(
+        record = BillingRecord(
             user_id=user.id,
-            type=OrderType.RENEW,
-            amount=-charge_amount,
-            status=OrderStatus.PAID,
-            paid_at=datetime.utcnow(),
-            product_name=f"{instance_type} 实例按量计费",
-            billing_cycle="hourly",
-            description=f"按量计费({interval_desc})",
-            **order_kwargs,
+            amount=charge_amount,
+            hourly_price=hourly_price,
+            duration_seconds=duration,
+            period_start=last_billed,
+            period_end=now,
+            description=f"按量计费",
+            **fk_kwargs,
         )
-        session.add(order)
+        session.add(record)
+        instance.last_billed_at = now  # 更新计费时间点
         await session.commit()
 
         return {
             "status": "processed",
             "instance_id": instance_id,
             "amount": charge_amount,
+            "duration_seconds": duration,
             "new_balance": user.balance,
-            "processed_at": datetime.utcnow().isoformat(),
+            "processed_at": now.isoformat(),
         }
 
 
@@ -216,7 +227,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
             select(SystemSetting).where(SystemSetting.key == "billing_interval_minutes")
         )
         setting = result.scalar_one_or_none()
-        billing_interval = json.loads(setting.value) if setting else 60
+        billing_interval = json.loads(setting.value) if setting else 15
 
         # 读取上次执行时间
         result = await session.execute(
@@ -379,18 +390,21 @@ async def sync_instance_status_task(ctx: dict) -> dict:
 
                 old_status = inst.status
                 inst.status = new_status
-                if new_status == _IS.RUNNING and not inst.started_at:
-                    inst.started_at = datetime.utcnow()
-                    try:
-                        inst_ns = inst.namespace or "lmaicloud"
-                        pods = k8s.list_pods(
-                            namespace=inst_ns,
-                            label_selector=f"instance-id={inst_id}",
-                        )
-                        if pods and pods[0].get("ip"):
-                            inst.internal_ip = pods[0]["ip"]
-                    except Exception:
-                        pass
+                if new_status == _IS.RUNNING:
+                    if not inst.started_at:
+                        inst.started_at = datetime.utcnow()
+                        try:
+                            inst_ns = inst.namespace or "lmaicloud"
+                            pods = k8s.list_pods(
+                                namespace=inst_ns,
+                                label_selector=f"instance-id={inst_id}",
+                            )
+                            if pods and pods[0].get("ip"):
+                                inst.internal_ip = pods[0]["ip"]
+                        except Exception:
+                            pass
+                    # 进入 RUNNING 即开始计费（包括重启后）
+                    inst.last_billed_at = datetime.utcnow()
 
                 await session.commit()
                 synced += 1
@@ -637,8 +651,11 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                     if new_status != inst.status:
                         old_status = inst.status
                         inst.status = new_status
-                        if new_status == "running" and not inst.started_at:
-                            inst.started_at = datetime.utcnow()
+                        if new_status == "running":
+                            if not inst.started_at:
+                                inst.started_at = datetime.utcnow()
+                            # 进入 RUNNING 即开始计费（包括重启后）
+                            inst.last_billed_at = datetime.utcnow()
                         synced += 1
 
                         # Redis pub/sub 通知

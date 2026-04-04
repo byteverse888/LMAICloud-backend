@@ -5,6 +5,11 @@ from contextlib import asynccontextmanager
 import asyncio
 import json
 import traceback
+import subprocess
+import sys
+import os
+import atexit
+import signal
 
 from app.config import settings
 from app.database import init_db
@@ -85,6 +90,44 @@ async def _seed_public_datasets():
         logger.warning(f"预置公开数据集失败: {e}")
 
 
+# ── ARQ Worker 子进程管理 ──────────────────────────────────────────
+_arq_worker_process: subprocess.Popen | None = None
+
+
+def _start_arq_worker():
+    """启动 ARQ Worker 子进程（随 FastAPI 主进程自动拉起）"""
+    global _arq_worker_process
+    try:
+        # 使用与当前进程相同的 Python 解释器
+        env = os.environ.copy()
+        _arq_worker_process = subprocess.Popen(
+            [sys.executable, "-m", "arq", "app.tasks.WorkerSettings"],
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        logger.info(f"ARQ Worker 子进程已启动 (PID: {_arq_worker_process.pid})")
+        # 注册退出钩子，确保主进程异常退出时子进程也能被清理
+        atexit.register(_stop_arq_worker)
+    except Exception as e:
+        logger.warning(f"ARQ Worker 启动失败: {e}，计费/状态同步等定时任务将不可用")
+
+
+def _stop_arq_worker():
+    """停止 ARQ Worker 子进程"""
+    global _arq_worker_process
+    if _arq_worker_process and _arq_worker_process.poll() is None:
+        logger.info(f"正在停止 ARQ Worker 子进程 (PID: {_arq_worker_process.pid})...")
+        _arq_worker_process.terminate()
+        try:
+            _arq_worker_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _arq_worker_process.kill()
+        logger.info("ARQ Worker 子进程已停止")
+    _arq_worker_process = None
+
+
 # ── Redis 订阅: 接收 ARQ Worker 的状态变更，转发 WebSocket ──────────
 async def _subscribe_instance_status():
     """
@@ -152,10 +195,14 @@ async def lifespan(app: FastAPI):
     sub_task = asyncio.create_task(_subscribe_instance_status())
     logger.info("Redis PubSub 订阅已启动 (lmaicloud:instance_status)")
     
+    # 自动启动 ARQ Worker 子进程（计费、状态同步等定时任务）
+    _start_arq_worker()
+    
     yield
     
     # Shutdown
     logger.info("应用正在关闭...")
+    _stop_arq_worker()
     sub_task.cancel()
     try:
         await sub_task

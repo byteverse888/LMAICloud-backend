@@ -7,6 +7,7 @@
 import asyncio
 import json
 from datetime import datetime, timedelta, timezone
+from dateutil.relativedelta import relativedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Request
@@ -14,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, Instance, InstanceStatus, AppImage
+from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus
 from app.schemas import (
     InstanceCreate, InstanceResponse, ResourceConfigResponse, PaginatedResponse,
 )
@@ -370,8 +371,15 @@ async def create_instance(
                 detail=f"GPU不足: 需要{total_gpu}, 可用{nd_gpu_alloc}"
             )
 
-    if current_user.balance < 0:
-        raise HTTPException(status_code=400, detail="余额不足")
+    unit_price = nd_hourly * (instance_data.gpu_count if instance_data.resource_type != "no_gpu" else 1)
+    if instance_data.billing_type in ('monthly', 'yearly'):
+        period_price = unit_price * 24 * (30 if instance_data.billing_type == 'monthly' else 365)
+        billing_label = '包月' if instance_data.billing_type == 'monthly' else '包年'
+        if current_user.balance < period_price:
+            raise HTTPException(status_code=400, detail="{}需要 ¥{:.2f}，余额不足".format(billing_label, period_price))
+    else:
+        if current_user.balance < unit_price:
+            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{unit_price:.2f}")
 
     # 镜像：优先用前端传来的 image_url，其次从 app_images 表查找
     image_url = instance_data.image_url
@@ -457,6 +465,49 @@ async def create_instance(
     except Exception as e:
         logger.warning(f"记录创建实例日志失败: {e}")
 
+    # 创建订单记录 + 包月/包年首期扣费
+    try:
+        billing_cycle = str(instance.billing_type) if instance.billing_type else 'hourly'
+        if billing_cycle in ('monthly', 'yearly'):
+            # 包月/包年：首期扣费 + 初始化 expired_at
+            period_price = instance.hourly_price * 24 * (30 if billing_cycle == 'monthly' else 365)
+            current_user.balance -= period_price
+            instance.expired_at = datetime.utcnow() + (
+                relativedelta(months=1) if billing_cycle == 'monthly' else relativedelta(years=1)
+            )
+            create_order = Order(
+                user_id=current_user.id,
+                instance_id=instance.id,
+                type=OrderType.RENEW,
+                amount=-period_price,
+                status=OrderStatus.PAID,
+                paid_at=datetime.utcnow(),
+                product_name=f"{instance.gpu_model or 'GPU'} 容器实例",
+                billing_cycle=billing_cycle,
+                description="创建容器实例 - {} ({}首期)".format(instance.name, '包月' if billing_cycle == 'monthly' else '包年'),
+            )
+            logger.info(f"包月/包年首期扣费 - 用户: {current_user.id}, 金额: {period_price}, 到期: {instance.expired_at}")
+        else:
+            # 按量计费：不扣费，仅记录
+            create_order = Order(
+                user_id=current_user.id,
+                instance_id=instance.id,
+                type=OrderType.CREATE,
+                amount=0,
+                status=OrderStatus.PAID,
+                paid_at=datetime.utcnow(),
+                product_name=f"{instance.gpu_model or 'GPU'} 容器实例",
+                billing_cycle=billing_cycle,
+                description=f"创建容器实例 - {instance.name} (按量计费)",
+            )
+        db.add(create_order)
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"创建订单记录失败: {e}")
+
+    # 计费说明：按量计费创建时不扣费，等进入 RUNNING 后由定时任务按实际运行时长计费
+    # 包月/包年创建时已扣首期费用并设置 expired_at，到期由定时任务自动续费
+
     # 后台: 生成 Deployment YAML -> 调用 K8s -> 轮询 Pod 就绪
     async def create_k8s_resources(inst_id, k8s_node_name, nd_type):
         pod_manager = get_pod_manager()
@@ -538,6 +589,7 @@ async def create_instance(
                 if inst:
                     inst.status = InstanceStatus.RUNNING
                     inst.started_at = datetime.utcnow()
+                    inst.last_billed_at = datetime.utcnow()  # 进入 RUNNING 开始计费
                     inst.internal_ip = pod_ip
                     await session.commit()
                     logger.info(f"实例状态已更新 - {inst_id}: running")
@@ -661,6 +713,10 @@ async def start_instance(
     if instance.status not in (InstanceStatus.STOPPED, InstanceStatus.ERROR):
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法启动")
 
+    # 余额检查：至少够1小时费用
+    if current_user.balance < instance.hourly_price:
+        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{instance.hourly_price:.2f}")
+
     pod_manager = get_pod_manager()
     inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
     success = await asyncio.to_thread(pod_manager.start_instance, str(instance.id), inst_ns)
@@ -703,6 +759,7 @@ async def start_instance(
                 inst = res.scalar_one_or_none()
                 if inst:
                     inst.status = InstanceStatus.RUNNING
+                    inst.last_billed_at = datetime.utcnow()  # 进入 RUNNING 开始计费
                     pod_ip = poll_result.get("pod_ip", "")
                     if pod_ip:
                         inst.internal_ip = pod_ip
@@ -740,6 +797,15 @@ async def stop_instance(
         raise HTTPException(status_code=404, detail="实例不存在")
     if instance.status != InstanceStatus.RUNNING:
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法停止")
+
+    # 停机前即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        user_result = await db.execute(select(User).where(User.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(instance, user_obj, db, "gpu", "停机结算")
+    except Exception as e:
+        logger.warning(f"停机结算失败: {e}")
 
     pod_manager = get_pod_manager()
     inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
@@ -809,6 +875,15 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
 
+    # 删除前即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        user_result = await db.execute(select(User).where(User.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(instance, user_obj, db, "gpu", "删除结算")
+    except Exception as e:
+        logger.warning(f"强制删除结算失败: {e}")
+
     # 1. 先更新 DB 状态（立即响应，避免 K8s 操作阻塞导致 NetworkError）
     inst_name = instance.name
     try:
@@ -868,6 +943,15 @@ async def release_instance(
         raise HTTPException(status_code=404, detail="实例不存在")
     if instance.status in (InstanceStatus.RELEASING, InstanceStatus.RELEASED):
         raise HTTPException(status_code=400, detail=f"实例已处于 {instance.status} 状态，无需重复操作")
+
+    # 删除前即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        user_result = await db.execute(select(User).where(User.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(instance, user_obj, db, "gpu", "删除结算")
+    except Exception as e:
+        logger.warning(f"删除结算失败: {e}")
 
     gpu_count = instance.gpu_count
     instance.status = InstanceStatus.RELEASING
