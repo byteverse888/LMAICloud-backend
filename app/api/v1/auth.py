@@ -578,6 +578,19 @@ async def login(user_data: UserLogin, request: Request, db: AsyncSession = Depen
     
     if not user or not verify_password(user_data.password, user.password_hash):
         logger.warning(f"登录失败-用户名或密码错误: {user_data.email}")
+        # 记录登录失败日志
+        try:
+            from app.api.v1.audit_log import create_audit_log, get_client_ip
+            from app.models import AuditAction, AuditResourceType
+            await create_audit_log(
+                db, user.id if user else None, AuditAction.LOGIN_FAILED, AuditResourceType.ACCOUNT,
+                resource_name=user_data.email,
+                detail="邮箱或密码错误",
+                ip_address=get_client_ip(request),
+            )
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"记录登录失败日志失败: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="邮箱或密码错误"

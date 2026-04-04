@@ -12,6 +12,8 @@
   7. 平台功能升级 (add_platform_upgrade + platform_upgrade_v2)
   8. 预置种子数据 (resource_plans / market_products / app_images / images)
   9. 按实际运行时长计费改造 (billing_records + last_billed_at)
+ 10~13. 某些补充字段
+ 14. 审计日志支持登录失败记录 (login_failed + user_id nullable)
 
 用法:
   cd LMAICloud-backend
@@ -602,6 +604,12 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     ("13. ai_users 增加 instance_quota 字段", [
         "ALTER TABLE ai_users ADD COLUMN IF NOT EXISTS instance_quota INTEGER DEFAULT 20",
         "UPDATE ai_users SET instance_quota = 20 WHERE instance_quota IS NULL",
+    ]),
+
+# ── 14. 审计日志支持登录失败记录 ─────────────────────
+    ("14. 审计日志支持登录失败记录 (login_failed + user_id nullable)", [
+        "ALTER TYPE auditaction ADD VALUE IF NOT EXISTS 'LOGIN_FAILED'",
+        "ALTER TABLE audit_logs ALTER COLUMN user_id DROP NOT NULL",
     ]),
 ]
 

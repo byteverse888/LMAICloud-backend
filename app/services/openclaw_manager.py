@@ -390,15 +390,15 @@ class OpenClawManager:
 
             # 2. 创建 Secret
             secret_spec = self.build_env_secret(instance_id, ns, gateway_token, model_keys)
-            self.k8s.core_api.create_namespaced_secret(ns, secret_spec)
+            self.k8s.core_v1.create_namespaced_secret(ns, secret_spec)
 
             # 3. 创建 ConfigMap
             cm_spec = self.build_config_map(instance_id, ns, channels)
-            self.k8s.core_api.create_namespaced_config_map(ns, cm_spec)
+            self.k8s.core_v1.create_namespaced_config_map(ns, cm_spec)
 
             # 4. 创建 PVC
             pvc_spec = self.build_pvc(instance_id, ns, disk_gb, node_type, storage_class, edge_storage_path)
-            self.k8s.core_api.create_namespaced_persistent_volume_claim(ns, pvc_spec)
+            self.k8s.core_v1.create_namespaced_persistent_volume_claim(ns, pvc_spec)
 
             # 5. 创建 Deployment
             dep_spec = self.build_deployment(
@@ -444,15 +444,15 @@ class OpenClawManager:
         except Exception:
             pass
         try:
-            self.k8s.core_api.delete_namespaced_secret(f"{name}-env", namespace)
+            self.k8s.core_v1.delete_namespaced_secret(f"{name}-env", namespace)
         except Exception:
             pass
         try:
-            self.k8s.core_api.delete_namespaced_config_map(f"{name}-config", namespace)
+            self.k8s.core_v1.delete_namespaced_config_map(f"{name}-config", namespace)
         except Exception:
             pass
         try:
-            self.k8s.core_api.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
+            self.k8s.core_v1.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
         except Exception:
             pass
         return True
@@ -509,7 +509,7 @@ class OpenClawManager:
         name = self.resource_name(instance_id)
         secret_spec = self.build_env_secret(instance_id, namespace, gateway_token, model_keys)
         try:
-            self.k8s.core_api.replace_namespaced_secret(f"{name}-env", namespace, secret_spec)
+            self.k8s.core_v1.replace_namespaced_secret(f"{name}-env", namespace, secret_spec)
             # 触发滚动重启
             self.k8s.restart_deployment(f"{name}-deploy", namespace)
             return True
@@ -527,7 +527,7 @@ class OpenClawManager:
         name = self.resource_name(instance_id)
         cm_spec = self.build_config_map(instance_id, namespace, channels, skills)
         try:
-            self.k8s.core_api.replace_namespaced_config_map(f"{name}-config", namespace, cm_spec)
+            self.k8s.core_v1.replace_namespaced_config_map(f"{name}-config", namespace, cm_spec)
             self.k8s.restart_deployment(f"{name}-deploy", namespace)
             return True
         except Exception:

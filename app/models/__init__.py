@@ -660,6 +660,7 @@ class AuditAction(str, enum.Enum):
     STOP = "stop"
     RESTART = "restart"
     LOGIN = "login"
+    LOGIN_FAILED = "login_failed"
     LOGOUT = "logout"
     REGISTER = "register"
     RECHARGE = "recharge"
@@ -679,7 +680,7 @@ class AuditLog(Base):
     __tablename__ = "audit_logs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=False, index=True)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("ai_users.id"), nullable=True, index=True)
     action = Column(Enum(AuditAction), nullable=False)
     resource_type = Column(Enum(AuditResourceType), nullable=False)
     resource_id = Column(String(100), nullable=True)
