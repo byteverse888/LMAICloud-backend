@@ -106,12 +106,22 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         else:
             result = await session.execute(select(Instance).where(Instance.id == instance_id))
             instance = result.scalar_one_or_none()
-            if not instance or instance.status != InstanceStatus.RUNNING:
-                return {"status": "skipped", "reason": "instance not running"}
+            if not instance:
+                return {"status": "skipped", "reason": "instance not found"}
             hourly_price = instance.hourly_price
             billing_cycle = getattr(instance, "billing_cycle", None) or instance.billing_type or "hourly"
             inst_user_id = instance.user_id
             fk_kwargs = {"instance_id": instance.id}
+
+            # 状态检查：区分计费类型
+            if billing_cycle in ("monthly", "yearly"):
+                # 包月/包年：只要不是 RELEASED/RELEASING 就检查续费
+                if instance.status in (InstanceStatus.RELEASED, InstanceStatus.RELEASING):
+                    return {"status": "skipped", "reason": "instance released"}
+            else:
+                # 按量计费：必须 RUNNING 才计费
+                if instance.status != InstanceStatus.RUNNING:
+                    return {"status": "skipped", "reason": "instance not running"}
 
         # 获取用户
         result = await session.execute(select(User).where(User.id == inst_user_id))
@@ -260,9 +270,16 @@ async def process_all_billing_task(ctx: dict) -> dict:
     errors = 0
 
     async with AsyncSessionLocal() as session:
-        # GPU 实例
+        # GPU 实例：按量计费只查 RUNNING，包月/包年还包含 STOPPED/EXPIRED 以支持自动续费
+        from app.models import BillingType
         result = await session.execute(
-            select(Instance).where(Instance.status == _IS.RUNNING)
+            select(Instance).where(
+                (Instance.status == _IS.RUNNING) |
+                (
+                    Instance.billing_type.in_([BillingType.MONTHLY, BillingType.YEARLY]) &
+                    Instance.status.in_([_IS.RUNNING, _IS.STOPPED, _IS.EXPIRED])
+                )
+            )
         )
         for instance in result.scalars().all():
             try:
@@ -403,8 +420,9 @@ async def sync_instance_status_task(ctx: dict) -> dict:
                                 inst.internal_ip = pods[0]["ip"]
                         except Exception:
                             pass
-                    # 进入 RUNNING 即开始计费（包括重启后）
-                    inst.last_billed_at = datetime.utcnow()
+                    # 进入 RUNNING 开始计费（仅按量计费实例，包月/包年走 expired_at 机制）
+                    if getattr(inst, 'billing_type', 'hourly') not in ('monthly', 'yearly'):
+                        inst.last_billed_at = datetime.utcnow()
 
                 await session.commit()
                 synced += 1

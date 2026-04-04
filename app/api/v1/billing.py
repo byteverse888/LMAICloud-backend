@@ -685,7 +685,7 @@ async def settle_instance_billing(
     """
     # 包月/包年实例不执行按量即时结算
     bt = getattr(instance, 'billing_type', None)
-    if bt and str(bt) in ('monthly', 'yearly'):
+    if bt and bt in ('monthly', 'yearly'):
         return None
 
     if not instance.last_billed_at:

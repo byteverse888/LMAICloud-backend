@@ -467,7 +467,7 @@ async def create_instance(
 
     # 创建订单记录 + 包月/包年首期扣费
     try:
-        billing_cycle = str(instance.billing_type) if instance.billing_type else 'hourly'
+        billing_cycle = instance.billing_type or 'hourly'
         if billing_cycle in ('monthly', 'yearly'):
             # 包月/包年：首期扣费 + 初始化 expired_at
             period_price = instance.hourly_price * 24 * (30 if billing_cycle == 'monthly' else 365)
@@ -589,7 +589,9 @@ async def create_instance(
                 if inst:
                     inst.status = InstanceStatus.RUNNING
                     inst.started_at = datetime.utcnow()
-                    inst.last_billed_at = datetime.utcnow()  # 进入 RUNNING 开始计费
+                    # 仅按量计费实例设置 last_billed_at，包月/包年走 expired_at 机制
+                    if getattr(inst, 'billing_type', 'hourly') not in ('monthly', 'yearly'):
+                        inst.last_billed_at = datetime.utcnow()
                     inst.internal_ip = pod_ip
                     await session.commit()
                     logger.info(f"实例状态已更新 - {inst_id}: running")
@@ -710,12 +712,25 @@ async def start_instance(
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
-    if instance.status not in (InstanceStatus.STOPPED, InstanceStatus.ERROR):
+    if instance.status not in (InstanceStatus.STOPPED, InstanceStatus.ERROR, InstanceStatus.EXPIRED):
         raise HTTPException(status_code=400, detail=f"当前状态 {instance.status} 无法启动")
 
-    # 余额检查：至少够1小时费用
-    if current_user.balance < instance.hourly_price:
-        raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{instance.hourly_price:.2f}")
+    # 余额检查：区分计费类型
+    bt = instance.billing_type or 'hourly'
+    if bt in ('monthly', 'yearly'):
+        # 包月/包年：检查是否在有效期内
+        if instance.expired_at and datetime.utcnow() > instance.expired_at:
+            # 已过期，检查续费余额
+            renew_price = instance.hourly_price * 24 * (30 if bt == 'monthly' else 365)
+            if current_user.balance < renew_price:
+                raise HTTPException(
+                    status_code=400,
+                    detail="订阅已过期且余额不足续费，需要 ¥{:.2f}".format(renew_price)
+                )
+    else:
+        # 按量计费：至少够1小时费用
+        if current_user.balance < instance.hourly_price:
+            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{instance.hourly_price:.2f}")
 
     pod_manager = get_pod_manager()
     inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
@@ -759,7 +774,9 @@ async def start_instance(
                 inst = res.scalar_one_or_none()
                 if inst:
                     inst.status = InstanceStatus.RUNNING
-                    inst.last_billed_at = datetime.utcnow()  # 进入 RUNNING 开始计费
+                    # 仅按量计费实例设置 last_billed_at，包月/包年走 expired_at 机制
+                    if getattr(inst, 'billing_type', 'hourly') not in ('monthly', 'yearly'):
+                        inst.last_billed_at = datetime.utcnow()
                     pod_ip = poll_result.get("pod_ip", "")
                     if pod_ip:
                         inst.internal_ip = pod_ip
@@ -1006,7 +1023,7 @@ async def renew_instance(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """续费实例"""
+    """续费实例：根据 billing_type 计算续费金额，扣费并延长 expired_at"""
     result = await db.execute(
         select(Instance).where(
             Instance.id == instance_id,
@@ -1017,14 +1034,59 @@ async def renew_instance(
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
 
-    # 简单续费：延长 expired_at
-    from datetime import timedelta
-    if instance.expired_at:
-        instance.expired_at = instance.expired_at + timedelta(hours=1)
+    bt = instance.billing_type or 'hourly'
+    if bt not in ('monthly', 'yearly'):
+        raise HTTPException(status_code=400, detail="按量计费实例无需手动续费")
+
+    # 计算续费金额
+    if bt == 'monthly':
+        renew_price = instance.hourly_price * 24 * 30
+        delta = relativedelta(months=1)
+        label = '包月'
     else:
-        instance.expired_at = datetime.utcnow() + timedelta(hours=1)
+        renew_price = instance.hourly_price * 24 * 365
+        delta = relativedelta(years=1)
+        label = '包年'
+
+    # 余额检查
+    if current_user.balance < renew_price:
+        raise HTTPException(
+            status_code=400,
+            detail="{}续费需要 ¥{:.2f}，余额不足".format(label, renew_price)
+        )
+
+    # 扣费
+    current_user.balance -= renew_price
+
+    # 延长有效期
+    base_time = instance.expired_at if instance.expired_at and instance.expired_at > datetime.utcnow() else datetime.utcnow()
+    instance.expired_at = base_time + delta
+
+    # 如果实例已过期，恢复为 STOPPED 状态（用户可手动启动）
+    if instance.status == InstanceStatus.EXPIRED:
+        instance.status = InstanceStatus.STOPPED
+
+    # 创建续费订单
+    renew_order = Order(
+        user_id=current_user.id,
+        instance_id=instance.id,
+        type=OrderType.RENEW,
+        amount=-renew_price,
+        status=OrderStatus.PAID,
+        paid_at=datetime.utcnow(),
+        product_name=f"{instance.gpu_model or 'GPU'} 容器实例",
+        billing_cycle=bt,
+        description="{}手动续费 - {}".format(label, instance.name),
+    )
+    db.add(renew_order)
     await db.commit()
-    return {"message": "续费成功", "expired_at": str(instance.expired_at)}
+
+    return {
+        "message": "续费成功",
+        "expired_at": str(instance.expired_at),
+        "amount": renew_price,
+        "new_balance": current_user.balance,
+    }
 
 
 @router.get("/{instance_id}/status", summary="获取实例 Deployment/Pod 运行状态")
