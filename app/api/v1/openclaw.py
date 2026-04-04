@@ -331,6 +331,7 @@ async def delete_instance(
         mgr.release_instance,
         instance_id=str(inst.id),
         namespace=inst.namespace,
+        node_type=inst.node_type or "center",
     )
 
     inst.status = "released"

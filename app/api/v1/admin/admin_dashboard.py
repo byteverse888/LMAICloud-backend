@@ -35,6 +35,15 @@ async def get_dashboard_stats(
 
     total_instances = (await db.execute(select(func.count(Instance.id)))).scalar() or 0
 
+    # OpenClaw 实例统计
+    from app.models import OpenClawInstance
+    oc_total = (await db.execute(
+        select(func.count(OpenClawInstance.id)).where(OpenClawInstance.status != 'released')
+    )).scalar() or 0
+    oc_running = (await db.execute(
+        select(func.count(OpenClawInstance.id)).where(OpenClawInstance.status == 'running')
+    )).scalar() or 0
+
     # K8s 节点和GPU
     nodes = k8s.list_nodes() if k8s.is_connected else []
     total_nodes = len(nodes)
@@ -87,6 +96,8 @@ async def get_dashboard_stats(
         "users": user_count,
         "instances": total_instances,
         "running_instances": running_instances,
+        "oc_total": oc_total,
+        "oc_running": oc_running,
         "gpu_total": gpu_total,
         "gpu_used": gpu_used,
         "today_revenue": float(today_income),

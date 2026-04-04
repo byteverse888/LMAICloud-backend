@@ -5,7 +5,7 @@ OpenClaw 实例 K8s 资源管理器
   Namespace → Secret → ConfigMap → PVC → Deployment → Service
 
 云端节点: 标准调度 + StorageClass PVC
-边缘节点: 节点亲和 + 污点容忍 + LocalPV + 断网自治
+边缘节点: 节点亲和 + 污点容忍 + hostPath 直接挂载 + 断网自治
 """
 import json
 import secrets
@@ -16,6 +16,7 @@ import yaml
 
 from app.services.k8s_client import get_k8s_client
 from app.services.pod_manager import PodManager
+from app.config import settings
 
 
 class OpenClawManager:
@@ -295,11 +296,23 @@ class OpenClawManager:
                 "name": "config-volume",
                 "configMap": {"name": f"{name}-config"},
             },
-            {
+        ]
+        # 边缘节点: 直接 hostPath 挂载，无需 PVC（边缘通常无动态存储供应器）
+        # 云端节点: 使用 PVC
+        if node_type == "edge":
+            edge_path = settings.openclaw_edge_storage_path
+            volumes.append({
+                "name": "data-volume",
+                "hostPath": {
+                    "path": f"{edge_path}/{instance_id}",
+                    "type": "DirectoryOrCreate",
+                },
+            })
+        else:
+            volumes.append({
                 "name": "data-volume",
                 "persistentVolumeClaim": {"claimName": f"{name}-data"},
-            },
-        ]
+            })
 
         # 节点调度
         tolerations = []
@@ -396,9 +409,10 @@ class OpenClawManager:
             cm_spec = self.build_config_map(instance_id, ns, channels)
             self.k8s.core_v1.create_namespaced_config_map(ns, cm_spec)
 
-            # 4. 创建 PVC
-            pvc_spec = self.build_pvc(instance_id, ns, disk_gb, node_type, storage_class, edge_storage_path)
-            self.k8s.core_v1.create_namespaced_persistent_volume_claim(ns, pvc_spec)
+            # 4. 创建 PVC（仅云端节点；边缘节点使用 hostPath 直接挂载）
+            if node_type != "edge":
+                pvc_spec = self.build_pvc(instance_id, ns, disk_gb, node_type, storage_class, edge_storage_path)
+                self.k8s.core_v1.create_namespaced_persistent_volume_claim(ns, pvc_spec)
 
             # 5. 创建 Deployment
             dep_spec = self.build_deployment(
@@ -432,7 +446,7 @@ class OpenClawManager:
         name = self.resource_name(instance_id)
         return self.k8s.scale_deployment(f"{name}-deploy", namespace, 0)
 
-    def release_instance(self, instance_id: str, namespace: str) -> bool:
+    def release_instance(self, instance_id: str, namespace: str, node_type: str = "center") -> bool:
         """释放实例 — 级联删除全部 K8s 资源"""
         name = self.resource_name(instance_id)
         try:
@@ -451,10 +465,12 @@ class OpenClawManager:
             self.k8s.core_v1.delete_namespaced_config_map(f"{name}-config", namespace)
         except Exception:
             pass
-        try:
-            self.k8s.core_v1.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
-        except Exception:
-            pass
+        # PVC 仅云端节点创建，边缘节点使用 hostPath 无 PVC
+        if node_type != "edge":
+            try:
+                self.k8s.core_v1.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
+            except Exception:
+                pass
         return True
 
     def update_spec(

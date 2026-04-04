@@ -863,7 +863,7 @@ class WorkerSettings:
         # OpenClaw: 每30秒监控通道在线状态
         cron(openclaw_channel_monitor, second={0, 30}, unique=True, timeout=25),
         # OpenClaw: 每2分钟同步实例 K8s 状态
-        cron(openclaw_instance_sync, second=0, minute={0, 2}, unique=True, timeout=115),
+        cron(openclaw_instance_sync, second=0, minute=set(range(0, 60, 2)), unique=True, timeout=115),
     ]
     
     # 启动和关闭钩子
