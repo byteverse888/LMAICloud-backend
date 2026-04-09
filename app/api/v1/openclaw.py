@@ -29,6 +29,7 @@ from app.utils.auth import get_current_user
 from app.services.openclaw_manager import get_openclaw_manager, OpenClawManager
 from app.services.openclaw_client import OpenClawClient, build_openclaw_url
 from app.services.pod_manager import PodManager
+from app.services.k8s_client import get_k8s_client
 from app.config import settings
 from app.tasks import enqueue_task
 
@@ -57,6 +58,35 @@ def _mask_key(key: str) -> str:
     if not key or len(key) < 8:
         return "***"
     return f"{key[:6]}...{key[-4:]}"
+
+
+# ====================================================================
+#  边缘节点列表（供创建实例时选择）
+# ====================================================================
+
+@router.get("/edge-nodes")
+async def list_edge_nodes(
+    current_user: User = Depends(get_current_user),
+):
+    """获取可用边缘节点列表（仅返回在线节点名称和基本信息）"""
+    k8s = get_k8s_client()
+    if not k8s.is_connected:
+        return {"list": []}
+    nodes = await asyncio.to_thread(
+        k8s.list_nodes,
+        label_selector="node-role.kubernetes.io/edge",
+    )
+    result = []
+    for n in nodes:
+        status = n.get("status", "NotReady")
+        if n.get("unschedulable"):
+            continue  # 跳过维护中的节点
+        result.append({
+            "name": n["name"],
+            "status": "online" if status == "Ready" else "offline",
+            "ip": n.get("ip"),
+        })
+    return {"list": result}
 
 
 # ====================================================================
@@ -128,6 +158,13 @@ async def create_instance(
         min_balance = hourly_price  # 至少夨1小时
         if current_user.balance < min_balance:
             raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+
+    # ── 边缘节点必须指定 node_name ──
+    if req.node_type == "edge" and not req.node_name:
+        raise HTTPException(
+            status_code=400,
+            detail="边缘节点必须指定节点名称 (node_name)，请从边缘节点列表中选择"
+        )
 
     user_ns = PodManager.user_namespace(str(current_user.id))
     image = req.image_url or settings.openclaw_default_image
@@ -742,6 +779,7 @@ async def _sync_config(inst: OpenClawInstance, db: AsyncSession):
         namespace=inst.namespace,
         channels=ch_dicts,
         skills=skill_names,
+        port=inst.port or 18789,
     )
 
 
@@ -966,6 +1004,78 @@ async def restart_instance(
     return {"detail": "重启中"}
 
 
+@router.delete("/instances/{instance_id}/force", summary="强制删除 OpenClaw 实例")
+async def force_delete_instance(
+    instance_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """强制删除：无论当前状态，直接清理 K8s 资源并标记为已删除"""
+    return await _do_force_delete(instance_id, current_user, db)
+
+
+@router.post("/instances/{instance_id}/force", summary="强制删除 OpenClaw 实例（POST 兼容入口）")
+async def force_delete_instance_post(
+    instance_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """与 DELETE /force 等价，供不支持 DELETE 的反向代理环境使用"""
+    return await _do_force_delete(instance_id, current_user, db)
+
+
+async def _do_force_delete(instance_id: UUID, current_user: User, db: AsyncSession):
+    """强制删除核心逻辑：先 DB 标记 released，再后台清理 K8s"""
+    result = await db.execute(
+        select(OpenClawInstance)
+        .where(OpenClawInstance.id == instance_id, OpenClawInstance.user_id == current_user.id)
+    )
+    inst = result.scalar_one_or_none()
+    if not inst:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    # 即时结算
+    try:
+        from app.api.v1.billing import settle_instance_billing
+        user_result = await db.execute(select(User).where(User.id == current_user.id))
+        user_obj = user_result.scalar_one()
+        await settle_instance_billing(inst, user_obj, db, "openclaw", "强制删除结算")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OpenClaw 强制删除结算失败: {e}")
+
+    inst.status = "released"
+    await db.commit()
+
+    # 后台清理 K8s 资源
+    try:
+        mgr = get_openclaw_manager()
+        await asyncio.to_thread(
+            mgr.release_instance,
+            instance_id=str(inst.id),
+            namespace=inst.namespace,
+            node_type=inst.node_type or "center",
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"OpenClaw 强制删除 K8s 清理异常（已忽略）: {e}")
+
+    # 审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.DELETE, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+            detail="强制删除",
+        )
+        await db.commit()
+    except Exception:
+        pass
+
+    return {"detail": "实例已强制删除"}
+
+
 @router.get("/instances/{instance_id}/logs")
 async def get_instance_logs(
     instance_id: UUID,
@@ -974,11 +1084,41 @@ async def get_instance_logs(
     db: AsyncSession = Depends(get_db),
 ):
     """获取 OpenClaw 实例 Pod 日志"""
+    import logging
+    logger = logging.getLogger(__name__)
+
     inst = await _get_instance_or_404(instance_id, current_user, db)
 
-    pm = PodManager()
-    logs = await asyncio.to_thread(
-        pm.get_instance_logs,
-        str(inst.id), tail, inst.namespace,
-    )
-    return {"logs": logs or ""}
+    from app.services.k8s_client import get_k8s_client
+    k8s = get_k8s_client()
+    # OpenClaw Pod 标签为 openclaw-instance={instance_id}（非 instance-id）
+    try:
+        pods = await asyncio.to_thread(
+            k8s.list_pods,
+            inst.namespace,
+            f"openclaw-instance={inst.id}",
+        )
+    except Exception as e:
+        logger.warning(f"OpenClaw 日志: list_pods 失败 ns={inst.namespace} id={inst.id}: {e}")
+        return {"logs": f"(获取 Pod 列表失败: {e})"}
+
+    if not pods:
+        return {"logs": f"(未找到运行中的 Pod，namespace={inst.namespace}, label=openclaw-instance={inst.id})"}
+
+    pod_name = pods[0]["name"]
+    pod_status = pods[0].get("effective_status", pods[0].get("status", "unknown"))
+    logger.info(f"OpenClaw 日志: pod={pod_name} status={pod_status} ns={inst.namespace}")
+
+    try:
+        # 显式指定容器名 gateway（Pod 含 init-config 初始化容器，需明确指定主容器）
+        logs = await asyncio.to_thread(
+            k8s.get_pod_logs, pod_name, inst.namespace, tail, "gateway",
+        )
+    except Exception as e:
+        logger.warning(f"OpenClaw 日志: get_pod_logs 失败 pod={pod_name}: {e}")
+        return {"logs": f"(获取日志失败: {e})"}
+
+    if logs is None:
+        return {"logs": f"(Pod {pod_name} 日志为空，容器可能尚未就绪，当前状态: {pod_status})"}
+
+    return {"logs": logs}

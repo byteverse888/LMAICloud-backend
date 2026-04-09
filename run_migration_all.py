@@ -3,17 +3,21 @@
 按依赖顺序执行，每步幂等（可重复运行）
 
 包含迁移:
-  1. 邮箱激活字段 (add_activation_token)
-  2. 实例 node_name (add_node_name_to_instances)
-  3. 实例 namespace (add_namespace_to_instances)
-  4. 用户文件系统 (add_user_files)
-  5. OpenClaw 模块 (add_openclaw_tables)
-  6. 计费系统升级 (add_billing_upgrade) -- 依赖 openclaw_instances
-  7. 平台功能升级 (add_platform_upgrade + platform_upgrade_v2)
-  8. 预置种子数据 (resource_plans / market_products / app_images / images)
-  9. 按实际运行时长计费改造 (billing_records + last_billed_at)
- 10~13. 某些补充字段
- 14. 审计日志支持登录失败记录 (login_failed + user_id nullable)
+  1.   邮箱激活字段 (add_activation_token)
+  2.   实例 node_name (add_node_name_to_instances)
+  2.5  Instance 表 V2 字段升级 (gpu_model/image_url/自动关机等20列)
+  3.   实例 namespace (add_namespace_to_instances)
+  4.   用户文件系统 (add_user_files)
+  5.   OpenClaw 模块 (add_openclaw_tables)
+  6.   计费系统升级 (add_billing_upgrade) -- 依赖 openclaw_instances
+  7.   平台功能升级 (add_platform_upgrade + platform_upgrade_v2)
+  8.   预置种子数据 (resource_plans / market_products / app_images / images)
+  9.   按实际运行时长计费改造 (billing_records + last_billed_at)
+  10.  BillingType 枚举补全 (daily/weekly/yearly)
+  11.  OpenClaw 实例计费字段
+  12.  billing_records 计费对象字段
+  13.  ai_users 实例配额字段
+  14.  审计日志支持登录失败记录
 
 用法:
   cd LMAICloud-backend
@@ -60,6 +64,37 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
            FROM nodes
            WHERE instances.node_id = nodes.id
              AND instances.node_name IS NULL""",
+    ]),
+
+    # ── 2.5 Instance 表 V2 字段升级 ────────────────────────
+    ("2.5 Instance 表 V2 字段升级 (20列)", [
+        # 资源与节点
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS gpu_model VARCHAR(100)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS resource_type VARCHAR(20) DEFAULT 'vGPU'",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS node_type VARCHAR(20) DEFAULT 'center'",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS instance_count INTEGER DEFAULT 1",
+        # 镜像与启动
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS image_url VARCHAR(500)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS startup_command VARCHAR(2000)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS env_vars TEXT",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS storage_mounts TEXT",
+        # 安装源
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS pip_source VARCHAR(100)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS conda_source VARCHAR(100)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS apt_source VARCHAR(100)",
+        # 自动关机/释放
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS auto_shutdown_type VARCHAR(20) DEFAULT 'none'",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS auto_shutdown_minutes INTEGER",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS auto_shutdown_time TIMESTAMP",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS auto_release_type VARCHAR(20) DEFAULT 'none'",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS auto_release_minutes INTEGER",
+        # 连接与状态
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS internal_ip VARCHAR(50)",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS deployment_yaml TEXT",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS health_status VARCHAR(20) DEFAULT 'unknown'",
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS release_at TIMESTAMP",
+        # 计费与到期
+        "ALTER TABLE instances ADD COLUMN IF NOT EXISTS expired_at TIMESTAMP",
     ]),
 
     # ── 3. 实例 namespace ────────────────────────────────────
@@ -564,8 +599,10 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
         "UPDATE openclaw_instances SET last_billed_at = NOW() WHERE status::text = 'running' AND last_billed_at IS NULL",
     ]),
 
-    # ── 10. BillingType 枚举补全 YEARLY ─────────────────────────
-    ("10. BillingType 枚举补全 yearly", [
+    # ── 10. BillingType 枚举补全 ─────────────────────────────────
+    ("10. BillingType 枚举补全 (daily/weekly/yearly)", [
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'daily'",
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'weekly'",
         "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'yearly'",
     ]),
 

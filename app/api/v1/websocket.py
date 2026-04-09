@@ -72,21 +72,26 @@ class TerminalManager:
             except Exception as e:
                 logger.error(f"Exec发送失败: {e}")
 
-    def read_from_exec(self, instance_id: str, timeout: float = 1) -> Optional[str]:
-        """从 exec stream 读取数据（阻塞式，需在线程中调用）"""
+    def read_from_exec(self, instance_id: str, timeout: float = 0.3) -> Optional[str]:
+        """从 exec stream 读取数据（阻塞式，需在线程中调用）
+        返回值:
+          - str (含数据): 有输出
+          - ""  (空串):   流仍打开但暂无数据
+          - None:         流已关闭 / 不存在
+        """
         if instance_id not in self.exec_streams:
             return None
         try:
             resp = self.exec_streams[instance_id]
-            if resp.is_open():
-                resp.update(timeout=timeout)
-                output = ""
-                if resp.peek_stdout():
-                    output += resp.read_stdout()
-                if resp.peek_stderr():
-                    output += resp.read_stderr()
-                return output if output else None
-            return None
+            if not resp.is_open():
+                return None
+            resp.update(timeout=timeout)
+            output = ""
+            if resp.peek_stdout():
+                output += resp.read_stdout()
+            if resp.peek_stderr():
+                output += resp.read_stderr()
+            return output   # 可能是 "" (暂无数据) 或实际输出
         except Exception as e:
             logger.error(f"read_from_exec 异常 - 实例: {instance_id}, 错误: {e}")
             return None
@@ -157,8 +162,11 @@ async def websocket_terminal(
         # 直接使用 kubectl exec 模式
         k8s = get_k8s_client()
         namespace = instance.namespace or "lmaicloud"
+        await websocket.send_json({"type": "info", "data": "正在查找 Pod..."})
         try:
-            pods = k8s.list_pods(namespace, label_selector=f"instance-id={instance_id}")
+            pods = await asyncio.to_thread(
+                k8s.list_pods, namespace, f"instance-id={instance_id}"
+            )
         except Exception as e:
             logger.error(f"K8s list_pods 异常: {e}")
             pods = []
@@ -169,9 +177,11 @@ async def websocket_terminal(
             })
             return
         pod_name = pods[0]["name"]
+        await websocket.send_json({"type": "info", "data": "正在建立终端连接..."})
         try:
-            exec_ok = terminal_manager.create_exec_connection(
-                pod_name=pod_name, namespace=namespace, instance_id=session_id
+            exec_ok = await asyncio.to_thread(
+                terminal_manager.create_exec_connection,
+                pod_name, namespace, session_id
             )
         except Exception as e:
             logger.error(f"create_exec_connection 异常: {e}")
@@ -196,6 +206,13 @@ async def websocket_terminal(
                     output = await asyncio.to_thread(
                         terminal_manager.read_from_exec, session_id
                     )
+                    if output is None:
+                        # 流已关闭（shell 退出）
+                        try:
+                            await websocket.send_json({"type": "info", "data": "终端会话已结束"})
+                            await websocket.close(code=1000, reason="Shell exited")
+                        except: pass
+                        break
                     if output:
                         await websocket.send_json({
                             "type": "output",
@@ -284,11 +301,18 @@ async def websocket_openclaw_terminal(
     try:
         k8s = get_k8s_client()
         namespace = instance.namespace or "lmaicloud"
+        import time as _time
+        await websocket.send_json({"type": "info", "data": "正在查找 Pod..."})
+        _t0 = _time.monotonic()
         try:
-            pods = k8s.list_pods(namespace, label_selector=f"openclaw-instance={instance_id}")
+            pods = await asyncio.to_thread(
+                k8s.list_pods, namespace, f"openclaw-instance={instance_id}"
+            )
         except Exception as e:
             logger.error(f"OpenClaw K8s list_pods 异常: {e}")
             pods = []
+        _t1 = _time.monotonic()
+        logger.info(f"OpenClaw 终端 list_pods 耗时: {_t1-_t0:.2f}s")
         if not pods:
             await websocket.send_json({
                 "type": "error",
@@ -296,13 +320,17 @@ async def websocket_openclaw_terminal(
             })
             return
         pod_name = pods[0]["name"]
+        await websocket.send_json({"type": "info", "data": "正在建立终端连接..."})
         try:
-            exec_ok = terminal_manager.create_exec_connection(
-                pod_name=pod_name, namespace=namespace, instance_id=session_id
+            exec_ok = await asyncio.to_thread(
+                terminal_manager.create_exec_connection,
+                pod_name, namespace, session_id
             )
         except Exception as e:
             logger.error(f"OpenClaw create_exec_connection 异常: {e}")
             exec_ok = False
+        _t2 = _time.monotonic()
+        logger.info(f"OpenClaw 终端 exec_connect 耗时: {_t2-_t1:.2f}s, 总耗时: {_t2-_t0:.2f}s")
         if not exec_ok:
             await websocket.send_json({
                 "type": "error",
@@ -321,6 +349,12 @@ async def websocket_openclaw_terminal(
                     output = await asyncio.to_thread(
                         terminal_manager.read_from_exec, session_id
                     )
+                    if output is None:
+                        try:
+                            await websocket.send_json({"type": "info", "data": "终端会话已结束"})
+                            await websocket.close(code=1000, reason="Shell exited")
+                        except: pass
+                        break
                     if output:
                         await websocket.send_json({
                             "type": "output",
@@ -445,6 +479,12 @@ async def websocket_openclaw_admin_terminal(
                     output = await asyncio.to_thread(
                         terminal_manager.read_from_exec, session_id
                     )
+                    if output is None:
+                        try:
+                            await websocket.send_json({"type": "info", "data": "终端会话已结束"})
+                            await websocket.close(code=1000, reason="Shell exited")
+                        except: pass
+                        break
                     if output:
                         await websocket.send_json({
                             "type": "output",

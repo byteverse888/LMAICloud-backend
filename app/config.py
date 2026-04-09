@@ -76,7 +76,8 @@ class Settings(BaseSettings):
     # OpenClaw
     openclaw_default_port: int = 18789
     openclaw_default_image: str = "ghcr.io/openclaw/openclaw:latest"
-    openclaw_storage_class: str = "standard"
+    openclaw_storage_class: str = "local-path"
+    openclaw_edge_storage_class: str = "openclaw-edge-local"
     openclaw_edge_storage_path: str = "/opt/openclaw-data"
     # OpenClaw 规格价格表 (cpu_cores, memory_gb) -> hourly_price
     openclaw_spec_prices: str = '{"1_2": 0.06, "2_4": 0.12, "4_8": 0.24, "8_16": 0.48}'

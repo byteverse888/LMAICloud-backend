@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+    lmaicloud/created-at: '2026-04-08T17:19:08.582953'
+    lmaicloud/instance-name: busybox1
+    lmaicloud/node-type: edge
+  labels: &id001
+    app: gpu-instance
+    instance-id: 0870439b-124a-4a7b-a52e-09006f4a6549
+    node-type: edge
+    user-id: 36436ea3-3071-4c5d-8ac3-f084d6d80f87
+  name: inst-0870439b
+  namespace: lmai-36436ea3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      instance-id: 0870439b-124a-4a7b-a52e-09006f4a6549
+  template:
+    metadata:
+      annotations:
+        lmaicloud/instance-name: busybox1
+        lmaicloud/node-type: edge
+      labels: *id001
+    spec:
+      containers:
+      - command:
+        - /bin/sh
+        - -c
+        - while true; do sleep 3600; done
+        env:
+        - name: INSTANCE_ID
+          value: 0870439b-124a-4a7b-a52e-09006f4a6549
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: all
+        - name: PIP_SOURCE
+          value: aliyun
+        - name: CONDA_SOURCE
+          value: aliyun
+        - name: APT_SOURCE
+          value: aliyun
+        image: busybox:latest
+        imagePullPolicy: IfNotPresent
+        name: gpu-container
+        resources:
+          limits:
+            cpu: '2'
+            memory: 4Gi
+          requests:
+            cpu: 1000m
+            memory: 2Gi
+        volumeMounts:
+        - mountPath: /root/data
+          name: instance-data
+      nodeName: 0xdf889bc557002a7b75ee47fc06d810d65c9257a6-202603300939
+      restartPolicy: Always
+      tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/edge
+        operator: Exists
+      - effect: NoExecute
+        key: node.kubernetes.io/unreachable
+        operator: Exists
+        tolerationSeconds: 60
+      volumes:
+      - emptyDir:
+          sizeLimit: 50Gi
+        name: instance-data

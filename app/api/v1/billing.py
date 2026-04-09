@@ -542,6 +542,10 @@ async def list_transactions(
                 "billing_cycle": "hourly",
                 "resource_type": record.resource_type,
                 "resource_name": record.instance_name,
+                "period_start": record.period_start.isoformat() if record.period_start else None,
+                "period_end": record.period_end.isoformat() if record.period_end else None,
+                "hourly_price": record.hourly_price,
+                "duration_seconds": record.duration_seconds,
             })
         for order in all_orders:
             # 解析订单关联的实例类型
@@ -690,6 +694,8 @@ async def settle_instance_billing(
     """
     即时结算：计算从 last_billed_at 到现在的实际运行费用。
     用于停止/删除实例时调用。仅对按量计费(hourly)实例生效。
+    只有实例处于 running/stopped 状态时才产生计费记录，
+    其他状态（creating/starting/error等）只清除 last_billed_at。
     """
     # 包月/包年实例不执行按量即时结算
     bt = getattr(instance, 'billing_type', None)
@@ -698,6 +704,15 @@ async def settle_instance_billing(
 
     if not instance.last_billed_at:
         return None  # 从未进入 RUNNING / 已结算
+
+    # 状态保护：非 running/stopped 状态，只清除 last_billed_at，不计费
+    inst_status = getattr(instance, 'status', None)
+    if inst_status:
+        status_val = inst_status.value if hasattr(inst_status, 'value') else str(inst_status)
+        if status_val not in ('running', 'stopped'):
+            print(f"[BILLING] settle_instance_billing: skip non-running instance (status={status_val}), clearing last_billed_at")
+            instance.last_billed_at = None
+            return None
 
     now = datetime.utcnow()
     duration = int((now - instance.last_billed_at).total_seconds())
@@ -711,6 +726,10 @@ async def settle_instance_billing(
 
     fk = {"instance_id": instance.id} if instance_type == "gpu" else {"openclaw_instance_id": instance.id}
     res_name = getattr(instance, 'name', None) or str(instance.id)[:8]
+    # 构造描述：包含计费区间和单价
+    period_desc = f"{instance.last_billed_at.strftime('%m/%d %H:%M')}~{now.strftime('%H:%M')}"
+    duration_min = duration // 60
+    desc = f"{res_name} {reason} {period_desc} ¥{hourly_price:.2f}/时 × {duration_min}分钟"
     record = BillingRecord(
         user_id=user.id,
         amount=amount,
@@ -718,7 +737,7 @@ async def settle_instance_billing(
         duration_seconds=duration,
         period_start=instance.last_billed_at,
         period_end=now,
-        description=f"{res_name} {reason}",
+        description=desc,
         instance_name=res_name,
         resource_type=instance_type,
         **fk,

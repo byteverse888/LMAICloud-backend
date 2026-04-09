@@ -822,6 +822,17 @@ class K8sClient:
             print(f"[K8s] Error deleting PV {name}: {e}")
             return False
 
+    def create_pv(self, body: Dict[str, Any]) -> bool:
+        """创建 PersistentVolume"""
+        if not self._initialized:
+            return False
+        try:
+            self.core_v1.create_persistent_volume(body=body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error creating PV: {e}")
+            return False
+
     def _parse_pv(self, pv) -> Dict[str, Any]:
         """解析 PV 对象"""
         spec = pv.spec

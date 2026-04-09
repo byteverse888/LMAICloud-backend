@@ -1,8 +1,11 @@
 """
-OpenClaw 实例 K8s 资源管理器
+OpenClaw 实例 K8s 资源管理器（对齐官方 K8s 部署规范）
 
 管理 OpenClaw 实例的完整 K8s 资源生命周期:
   Namespace → Secret → ConfigMap → PVC → Deployment → Service
+
+参考: https://docs.openclaw.ai/install/kubernetes
+      https://github.com/openclaw/openclaw/tree/main/scripts/k8s
 
 云端节点: 标准调度 + StorageClass PVC
 边缘节点: 节点亲和 + 污点容忍 + hostPath 直接挂载 + 断网自治
@@ -57,23 +60,23 @@ class OpenClawManager:
         model_keys: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        构建 K8s Secret，内容为 .env 格式。
-        挂载到 /home/node/.openclaw/.env
+        构建 K8s Secret（对齐官方 openclaw-secrets 结构）。
+        每个密钥作为独立键值对，Deployment 通过 secretKeyRef 引用。
         """
         name = self.resource_name(instance_id)
-        env_lines = [
-            f"OPENCLAW_GATEWAY_TOKEN={gateway_token}",
-        ]
+        string_data = {
+            "OPENCLAW_GATEWAY_TOKEN": gateway_token,
+        }
         for mk in (model_keys or []):
             if not mk.get("is_active", True):
                 continue
             provider = mk.get("provider", "").upper()
             api_key = mk.get("api_key", "")
             if provider and api_key:
-                env_lines.append(f"{provider}_API_KEY={api_key}")
+                string_data[f"{provider}_API_KEY"] = api_key
             base_url = mk.get("base_url")
             if base_url:
-                env_lines.append(f"{provider}_BASE_URL={base_url}")
+                string_data[f"{provider}_BASE_URL"] = base_url
 
         return {
             "apiVersion": "v1",
@@ -87,9 +90,7 @@ class OpenClawManager:
                 },
             },
             "type": "Opaque",
-            "stringData": {
-                ".env": "\n".join(env_lines),
-            },
+            "stringData": string_data,
         }
 
     # ========== ConfigMap 构建（非敏感配置） ==========
@@ -100,18 +101,48 @@ class OpenClawManager:
         namespace: str,
         channels: Optional[List[Dict[str, Any]]] = None,
         skills: Optional[List[str]] = None,
+        port: int = 18789,
     ) -> Dict[str, Any]:
         """
-        构建 ConfigMap，存储通道配置和 Skills 清单。
+        构建 ConfigMap（对齐官方 openclaw-config 结构）。
+        包含:
+        - openclaw.json: 网关配置（bind=lan, auth=token）
+        - AGENTS.md: 默认 Agent 指令
+        - openclaw-config.json: 通道/技能配置
         """
         name = self.resource_name(instance_id)
-        config_data = {
+
+        # 官方网关配置
+        gateway_config = {
+            "gateway": {
+                "mode": "local",
+                "bind": "lan",       # 平台通过 Service 访问，需绑定局域网
+                "port": port,
+                "auth": {"mode": "token"},
+                "controlUi": {"enabled": True},
+            },
+            "agents": {
+                "defaults": {"workspace": "~/.openclaw/workspace"},
+                "list": [
+                    {
+                        "id": "default",
+                        "name": "OpenClaw Assistant",
+                        "workspace": "~/.openclaw/workspace",
+                    },
+                ],
+            },
+            "cron": {"enabled": False},
+        }
+
+        # 通道/技能配置
+        channel_config = {
             "channels": [
                 {"type": ch.get("type"), "name": ch.get("name"), "config": ch.get("config")}
                 for ch in (channels or []) if ch.get("is_active", True)
             ],
             "skills": skills or [],
         }
+
         return {
             "apiVersion": "v1",
             "kind": "ConfigMap",
@@ -124,7 +155,58 @@ class OpenClawManager:
                 },
             },
             "data": {
-                "openclaw-config.json": json.dumps(config_data, ensure_ascii=False),
+                "openclaw.json": json.dumps(gateway_config, ensure_ascii=False),
+                "AGENTS.md": "# OpenClaw Assistant\n\nYou are a helpful AI assistant running on LMAICloud.",
+                "openclaw-config.json": json.dumps(channel_config, ensure_ascii=False),
+            },
+        }
+
+    # ========== PV 构建（边缘节点专用） ==========
+
+    def build_local_pv(
+        self,
+        instance_id: str,
+        disk_gb: int,
+        node_name: str,
+        edge_storage_path: str = "/opt/openclaw-data",
+    ) -> Dict[str, Any]:
+        """
+        构建边缘节点 PersistentVolume（hostPath + nodeAffinity）。
+        - 每个实例独立目录: {edge_storage_path}/{instance_id}
+        - nodeAffinity 绑定到指定边缘节点
+        - 配合 no-provisioner StorageClass 静态供应
+        """
+        name = self.resource_name(instance_id)
+        return {
+            "apiVersion": "v1",
+            "kind": "PersistentVolume",
+            "metadata": {
+                "name": f"{name}-data-pv",
+                "labels": {
+                    "app": "openclaw",
+                    "openclaw-instance": str(instance_id),
+                },
+            },
+            "spec": {
+                "capacity": {"storage": f"{disk_gb}Gi"},
+                "accessModes": ["ReadWriteOnce"],
+                "persistentVolumeReclaimPolicy": "Delete",
+                "storageClassName": settings.openclaw_edge_storage_class,
+                "hostPath": {
+                    "path": f"{edge_storage_path}/{instance_id}",
+                    "type": "DirectoryOrCreate",
+                },
+                "nodeAffinity": {
+                    "required": {
+                        "nodeSelectorTerms": [{
+                            "matchExpressions": [{
+                                "key": "kubernetes.io/hostname",
+                                "operator": "In",
+                                "values": [node_name],
+                            }],
+                        }],
+                    },
+                },
             },
         }
 
@@ -137,15 +219,28 @@ class OpenClawManager:
         disk_gb: int,
         node_type: str = "center",
         storage_class: str = "standard",
-        edge_storage_path: str = "/opt/openclaw-data",
     ) -> Dict[str, Any]:
         """
         构建 PersistentVolumeClaim。
-        - 云端: 使用 StorageClass
-        - 边缘: 使用 hostPath (通过 local-path-provisioner 或直接 hostPath volume)
+        - 云端: 使用动态供应 StorageClass
+        - 边缘: 使用 no-provisioner StorageClass（需先创建 PV）
         """
         name = self.resource_name(instance_id)
-        pvc = {
+        is_edge = node_type != "center"
+        sc = settings.openclaw_edge_storage_class if is_edge else storage_class
+        spec: Dict[str, Any] = {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": sc,
+            "resources": {
+                "requests": {
+                    "storage": f"{disk_gb}Gi",
+                },
+            },
+        }
+        # 边缘节点: 显式绑定到已创建的静态 PV
+        if is_edge:
+            spec["volumeName"] = f"{name}-data-pv"
+        return {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
             "metadata": {
@@ -156,21 +251,8 @@ class OpenClawManager:
                     "openclaw-instance": str(instance_id),
                 },
             },
-            "spec": {
-                "accessModes": ["ReadWriteOnce"],
-                "resources": {
-                    "requests": {
-                        "storage": f"{disk_gb}Gi",
-                    },
-                },
-            },
+            "spec": spec,
         }
-        if node_type == "center":
-            pvc["spec"]["storageClassName"] = storage_class
-        else:
-            # 边缘节点: 使用 local-path (如果有 provisioner) 或留空让集群默认处理
-            pvc["spec"]["storageClassName"] = "local-path"
-        return pvc
 
     # ========== Service 构建 ==========
 
@@ -209,7 +291,7 @@ class OpenClawManager:
             },
         }
 
-    # ========== Deployment 构建 ==========
+    # ========== Deployment 构建（对齐官方 deployment.yaml） ==========
 
     def build_deployment(
         self,
@@ -223,98 +305,153 @@ class OpenClawManager:
         node_type: str = "center",
     ) -> Dict[str, Any]:
         """
-        构建 OpenClaw Deployment。
-        - Secret → .env 文件挂载
-        - ConfigMap → 配置文件挂载
-        - PVC → 持久化存储挂载
-        - 健康检查: /healthz + /readyz
+        构建 OpenClaw Deployment（对齐官方 deployment.yaml 结构）。
+        - initContainer: busybox 复制 ConfigMap 到主目录
+        - Secret: 通过 secretKeyRef 注入环境变量
+        - 安全加固: readOnlyRootFilesystem, runAsNonRoot, drop ALL
+        - 健康检查: exec 方式（官方标准）
+        - 部署策略: Recreate
         """
         name = self.resource_name(instance_id)
         labels = {
             "app": "openclaw",
             "openclaw-instance": str(instance_id),
         }
+        secret_name = f"{name}-env"
 
         # 资源限制: limits = 用户规格, requests = 规格的一半
         cpu_limit = max(1, min(cpu_cores, 8))
-        cpu_request_m = max(250, cpu_limit * 500)   # requests = limits / 2
+        cpu_request_m = max(250, cpu_limit * 500)
         mem_limit = max(1, min(memory_gb, 32))
-        mem_request = max(1, mem_limit // 2) if mem_limit > 1 else 1  # requests = limits / 2
+        mem_request = max(1, mem_limit // 2) if mem_limit > 1 else 1
+
+        # ── initContainer: 以 root 复制 ConfigMap 并设置权限 ──
+        init_container = {
+            "name": "init-config",
+            "image": "busybox:1.37",
+            "imagePullPolicy": "IfNotPresent",
+            "command": [
+                "sh", "-c",
+                # 先 chown 确保目录可写（解决边缘节点 hostPath PV 初始权限问题）
+                "chown -R 1000:1000 /home/node/.openclaw && "
+                "cp /config/openclaw.json /home/node/.openclaw/openclaw.json && "
+                "mkdir -p /home/node/.openclaw/workspace && "
+                "cp /config/AGENTS.md /home/node/.openclaw/workspace/AGENTS.md && "
+                "cp /config/openclaw-config.json /home/node/.openclaw/openclaw-config.json && "
+                "chown -R 1000:1000 /home/node/.openclaw"
+            ],
+            "securityContext": {
+                "runAsUser": 0,
+                "runAsGroup": 0,
+            },
+            "resources": {
+                "requests": {"memory": "32Mi", "cpu": "50m"},
+                "limits": {"memory": "64Mi", "cpu": "100m"},
+            },
+            "volumeMounts": [
+                {"name": "openclaw-home", "mountPath": "/home/node/.openclaw"},
+                {"name": "config-volume", "mountPath": "/config"},
+            ],
+        }
+
+        # ── 环境变量: 固定值 + secretKeyRef ──
+        env_vars = [
+            {"name": "HOME", "value": "/home/node"},
+            {"name": "OPENCLAW_CONFIG_DIR", "value": "/home/node/.openclaw"},
+            {"name": "NODE_ENV", "value": "production"},
+            {
+                "name": "OPENCLAW_GATEWAY_TOKEN",
+                "valueFrom": {
+                    "secretKeyRef": {"name": secret_name, "key": "OPENCLAW_GATEWAY_TOKEN"},
+                },
+            },
+        ]
+        # 动态注入所有 provider API key（optional: true — Secret 中无此键时不报错）
+        for provider in ["ANTHROPIC", "OPENAI", "GEMINI", "OPENROUTER"]:
+            env_vars.append({
+                "name": f"{provider}_API_KEY",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": secret_name,
+                        "key": f"{provider}_API_KEY",
+                        "optional": True,
+                    },
+                },
+            })
+            # BASE_URL 也支持（自定义端点）
+            env_vars.append({
+                "name": f"{provider}_BASE_URL",
+                "valueFrom": {
+                    "secretKeyRef": {
+                        "name": secret_name,
+                        "key": f"{provider}_BASE_URL",
+                        "optional": True,
+                    },
+                },
+            })
+
+        # ── 主容器: gateway ──
+        healthz_cmd = (
+            f"require('http').get('http://127.0.0.1:{port}/healthz',"
+            f" r => process.exit(r.statusCode < 400 ? 0 : 1))"
+            f".on('error', () => process.exit(1))"
+        )
+        readyz_cmd = (
+            f"require('http').get('http://127.0.0.1:{port}/readyz',"
+            f" r => process.exit(r.statusCode < 400 ? 0 : 1))"
+            f".on('error', () => process.exit(1))"
+        )
 
         container = {
-            "name": "openclaw",
+            "name": "gateway",
             "image": image_url,
             "imagePullPolicy": "IfNotPresent",
-            "ports": [{"containerPort": port, "name": "gateway"}],
+            "ports": [{"containerPort": port, "name": "gateway", "protocol": "TCP"}],
             "resources": {
                 "limits": {"cpu": str(cpu_limit), "memory": f"{mem_limit}Gi"},
                 "requests": {"cpu": f"{cpu_request_m}m", "memory": f"{mem_request}Gi"},
             },
-            "env": [
-                {"name": "OPENCLAW_GATEWAY_BIND", "value": "lan"},
-                {"name": "NODE_ENV", "value": "production"},
-            ],
+            "env": env_vars,
             "volumeMounts": [
-                {
-                    "name": "env-secret",
-                    "mountPath": "/home/node/.openclaw/.env",
-                    "subPath": ".env",
-                    "readOnly": True,
-                },
-                {
-                    "name": "config-volume",
-                    "mountPath": "/home/node/.openclaw/config",
-                    "readOnly": True,
-                },
-                {
-                    "name": "data-volume",
-                    "mountPath": "/home/node/.openclaw/workspace",
-                },
+                {"name": "openclaw-home", "mountPath": "/home/node/.openclaw"},
+                {"name": "tmp-volume", "mountPath": "/tmp"},
             ],
             "livenessProbe": {
-                "httpGet": {"path": "/healthz", "port": port},
-                "initialDelaySeconds": 30,
+                "exec": {"command": ["node", "-e", healthz_cmd]},
+                "initialDelaySeconds": 60,
                 "periodSeconds": 30,
-                "timeoutSeconds": 5,
+                "timeoutSeconds": 10,
                 "failureThreshold": 3,
             },
             "readinessProbe": {
-                "httpGet": {"path": "/readyz", "port": port},
-                "initialDelaySeconds": 10,
+                "exec": {"command": ["node", "-e", readyz_cmd]},
+                "initialDelaySeconds": 15,
                 "periodSeconds": 10,
-                "timeoutSeconds": 3,
+                "timeoutSeconds": 5,
                 "failureThreshold": 3,
+            },
+            "securityContext": {
+                "runAsNonRoot": True,
+                "runAsUser": 1000,
+                "runAsGroup": 1000,
+                "allowPrivilegeEscalation": False,
+                "readOnlyRootFilesystem": True,
+                "capabilities": {"drop": ["ALL"]},
             },
         }
 
+        # ── Volumes ──
         volumes = [
-            {
-                "name": "env-secret",
-                "secret": {"secretName": f"{name}-env"},
-            },
-            {
-                "name": "config-volume",
-                "configMap": {"name": f"{name}-config"},
-            },
+            {"name": "config-volume", "configMap": {"name": f"{name}-config"}},
+            {"name": "tmp-volume", "emptyDir": {}},
         ]
-        # 边缘节点: 直接 hostPath 挂载，无需 PVC（边缘通常无动态存储供应器）
-        # 云端节点: 使用 PVC
-        if node_type == "edge":
-            edge_path = settings.openclaw_edge_storage_path
-            volumes.append({
-                "name": "data-volume",
-                "hostPath": {
-                    "path": f"{edge_path}/{instance_id}",
-                    "type": "DirectoryOrCreate",
-                },
-            })
-        else:
-            volumes.append({
-                "name": "data-volume",
-                "persistentVolumeClaim": {"claimName": f"{name}-data"},
-            })
+        # 数据卷: 云端和边缘统一使用 PVC — 挂载到 /home/node/.openclaw
+        volumes.append({
+            "name": "openclaw-home",
+            "persistentVolumeClaim": {"claimName": f"{name}-data"},
+        })
 
-        # 节点调度
+        # ── 节点调度 ──
         tolerations = []
         node_selector = {}
         if node_type == "edge":
@@ -333,7 +470,14 @@ class OpenClawManager:
                 },
             ])
 
+        # ── Pod Spec ──
         pod_spec = {
+            "automountServiceAccountToken": False,
+            "securityContext": {
+                "fsGroup": 1000,
+                "seccompProfile": {"type": "RuntimeDefault"},
+            },
+            "initContainers": [init_container],
             "containers": [container],
             "volumes": volumes,
             "restartPolicy": "Always",
@@ -360,6 +504,7 @@ class OpenClawManager:
             },
             "spec": {
                 "replicas": 1,
+                "strategy": {"type": "Recreate"},
                 "selector": {"matchLabels": {"openclaw-instance": str(instance_id)}},
                 "template": {
                     "metadata": {"labels": labels},
@@ -406,15 +551,23 @@ class OpenClawManager:
             self.k8s.core_v1.create_namespaced_secret(ns, secret_spec)
 
             # 3. 创建 ConfigMap
-            cm_spec = self.build_config_map(instance_id, ns, channels)
+            cm_spec = self.build_config_map(instance_id, ns, channels, port=port)
             self.k8s.core_v1.create_namespaced_config_map(ns, cm_spec)
 
-            # 4. 创建 PVC（仅云端节点；边缘节点使用 hostPath 直接挂载）
-            if node_type != "edge":
-                pvc_spec = self.build_pvc(instance_id, ns, disk_gb, node_type, storage_class, edge_storage_path)
-                self.k8s.core_v1.create_namespaced_persistent_volume_claim(ns, pvc_spec)
+            # 4. 边缘节点: 先创建 PV（静态供应）
+            if node_type == "edge":
+                if not node_name:
+                    return {"success": False, "error": "边缘节点必须指定 node_name"}
+                pv_spec = self.build_local_pv(
+                    instance_id, disk_gb, node_name, edge_storage_path,
+                )
+                self.k8s.create_pv(pv_spec)
 
-            # 5. 创建 Deployment
+            # 5. 创建 PVC（云端动态供应 / 边缘绑定已创建的 PV）
+            pvc_spec = self.build_pvc(instance_id, ns, disk_gb, node_type, storage_class)
+            self.k8s.core_v1.create_namespaced_persistent_volume_claim(ns, pvc_spec)
+
+            # 6. 创建 Deployment
             dep_spec = self.build_deployment(
                 instance_id, ns, image_url, port, cpu_cores, memory_gb, node_name, node_type,
             )
@@ -422,7 +575,7 @@ class OpenClawManager:
             if not dep_name:
                 return {"success": False, "error": "Failed to create Deployment"}
 
-            # 6. 创建 Service
+            # 7. 创建 Service
             svc_spec = self.build_service(instance_id, ns, port)
             self.k8s.create_service(ns, svc_spec)
 
@@ -465,10 +618,15 @@ class OpenClawManager:
             self.k8s.core_v1.delete_namespaced_config_map(f"{name}-config", namespace)
         except Exception:
             pass
-        # PVC 仅云端节点创建，边缘节点使用 hostPath 无 PVC
-        if node_type != "edge":
+        # PVC 和 PV 清理（云端和边缘都有 PVC）
+        try:
+            self.k8s.core_v1.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
+        except Exception:
+            pass
+        # 边缘节点额外清理 PV（PV 是集群级资源）
+        if node_type == "edge":
             try:
-                self.k8s.core_v1.delete_namespaced_persistent_volume_claim(f"{name}-data", namespace)
+                self.k8s.delete_pv(f"{name}-data-pv")
             except Exception:
                 pass
         return True
@@ -505,7 +663,7 @@ class OpenClawManager:
                 "template": {
                     "spec": {
                         "containers": [{
-                            "name": "openclaw",
+                            "name": "gateway",
                             **container_patch,
                         }]
                     }
@@ -538,10 +696,11 @@ class OpenClawManager:
         namespace: str,
         channels: List[Dict],
         skills: List[str],
+        port: int = 18789,
     ) -> bool:
         """热更新 ConfigMap → 触发 Deployment 滚动重启"""
         name = self.resource_name(instance_id)
-        cm_spec = self.build_config_map(instance_id, namespace, channels, skills)
+        cm_spec = self.build_config_map(instance_id, namespace, channels, skills, port=port)
         try:
             self.k8s.core_v1.replace_namespaced_config_map(f"{name}-config", namespace, cm_spec)
             self.k8s.restart_deployment(f"{name}-deploy", namespace)
@@ -556,8 +715,8 @@ class OpenClawManager:
                 namespace,
                 label_selector=f"openclaw-instance={instance_id}",
             )
-            if pods and pods[0].get("ip"):
-                return pods[0]["ip"]
+            if pods and pods[0].get("pod_ip"):
+                return pods[0]["pod_ip"]
         except Exception:
             pass
         return None

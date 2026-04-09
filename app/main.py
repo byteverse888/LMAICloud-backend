@@ -95,20 +95,31 @@ _arq_worker_process: subprocess.Popen | None = None
 
 
 def _start_arq_worker():
-    """启动 ARQ Worker 子进程（随 FastAPI 主进程自动拉起）"""
+    """启动 ARQ Worker 子进程（随 FastAPI 主进程自动拉起，仅启动一个）"""
     global _arq_worker_process
+
+    # 防止多 uvicorn worker 各自启动 ARQ：用 Redis 锁保证只启动一个
     try:
-        # 使用与当前进程相同的 Python 解释器
+        import redis as _redis_sync
+        from app.config import settings as _s
+        _r = _redis_sync.from_url(_s.redis_url)
+        # 尝试获取锁（60 秒自动过期，防止死锁）
+        if not _r.set("lmaicloud:arq_worker_lock", os.getpid(), nx=True, ex=60):
+            logger.info("ARQ Worker 已由其他进程启动，跳过")
+            return
+        _r.close()
+    except Exception:
+        pass  # Redis 不可用时仍尝试启动
+
+    try:
         env = os.environ.copy()
         _arq_worker_process = subprocess.Popen(
             [sys.executable, "-m", "arq", "app.tasks.WorkerSettings"],
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            # stdout/stderr 继承主进程，日志与 FastAPI 输出在一起
         )
         logger.info(f"ARQ Worker 子进程已启动 (PID: {_arq_worker_process.pid})")
-        # 注册退出钩子，确保主进程异常退出时子进程也能被清理
         atexit.register(_stop_arq_worker)
     except Exception as e:
         logger.warning(f"ARQ Worker 启动失败: {e}，计费/状态同步等定时任务将不可用")
@@ -126,6 +137,15 @@ def _stop_arq_worker():
             _arq_worker_process.kill()
         logger.info("ARQ Worker 子进程已停止")
     _arq_worker_process = None
+    # 释放 Redis 锁
+    try:
+        import redis as _redis_sync
+        from app.config import settings as _s
+        _r = _redis_sync.from_url(_s.redis_url)
+        _r.delete("lmaicloud:arq_worker_lock")
+        _r.close()
+    except Exception:
+        pass
 
 
 # ── Redis 订阅: 接收 ARQ Worker 的状态变更，转发 WebSocket ──────────
