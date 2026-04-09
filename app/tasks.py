@@ -837,6 +837,28 @@ async def startup(ctx: dict):
         print(f"[ARQ]   cron: {c.name}, second={c.second}, minute={c.minute}, unique={c.unique}")
     print(f"[ARQ] Total cron jobs: {len(WorkerSettings.cron_jobs)}")
 
+    # 启动时清理残留的 in-progress 键（上次 Worker 异常退出可能遗留）
+    redis = ctx.get('redis')
+    if redis:
+        try:
+            stale_keys = []
+            cursor = 0
+            while True:
+                cursor, keys = await redis.scan(cursor, match='arq:in-progress:*', count=100)
+                stale_keys.extend(keys)
+                if not cursor:  # cursor == 0 表示扫描完毕
+                    break
+            if stale_keys:
+                deleted = await redis.delete(*stale_keys)
+                key_names = [k.decode() if isinstance(k, bytes) else str(k) for k in stale_keys]
+                print(f"[ARQ] Cleaned {deleted} stale in-progress keys: {key_names}")
+            else:
+                print("[ARQ] No stale in-progress keys found")
+        except Exception as e:
+            print(f"[ARQ] Error cleaning stale keys: {e}")
+    else:
+        print("[ARQ] WARNING: redis not available in ctx, skip in-progress cleanup")
+
 
 async def shutdown(ctx: dict):
     """Worker 关闭时执行"""
@@ -893,7 +915,7 @@ class WorkerSettings:
     # Worker 配置
     max_jobs = 10  # 最大并发任务数
     job_timeout = 300  # 任务超时时间（秒）
-    keep_result = 3600  # 结果保留时间（秒）
+    keep_result = 600  # 结果保留 10 分钟（原 1 小时，减少 Redis 内存占用）
     health_check_interval = 60  # 健康检查间隔（秒）
 
 

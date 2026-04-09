@@ -25,8 +25,10 @@
 """
 import asyncio
 import sys
+import asyncpg
 from sqlalchemy import text
 from app.database import engine
+from app.config import settings
 
 
 # ============================================================
@@ -600,10 +602,10 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     ]),
 
     # ── 10. BillingType 枚举补全 ─────────────────────────────────
-    ("10. BillingType 枚举补全 (daily/weekly/yearly)", [
-        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'daily'",
-        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'weekly'",
-        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'yearly'",
+    ("10. BillingType 枚举补全 (DAILY/WEEKLY/YEARLY)", [
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'DAILY'",
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'WEEKLY'",
+        "ALTER TYPE billingtype ADD VALUE IF NOT EXISTS 'YEARLY'",
     ]),
 
     # ── 11. OpenClaw 实例计费字段 ─────────────────────────
@@ -666,12 +668,58 @@ async def run_migrations():
     print("=" * 60)
     print()
 
+    def is_alter_type_add_value(sql: str) -> bool:
+        """ALTER TYPE ... ADD VALUE 必须在事务外执行 (PostgreSQL 限制)"""
+        s = sql.strip().upper()
+        return "ALTER TYPE" in s and "ADD VALUE" in s
+
+    # ── Phase 1: ALTER TYPE ADD VALUE (必须 autocommit，PostgreSQL 不允许在事务内执行) ──
+    alter_type_sqls = []
+    for name, sqls in MIGRATIONS:
+        for sql in sqls:
+            if is_alter_type_add_value(sql):
+                alter_type_sqls.append((name, sql))
+
+    if alter_type_sqls:
+        print("[Phase 1] ALTER TYPE ADD VALUE (asyncpg 直连, autocommit)")
+        # asyncpg 默认 autocommit，不受 SQLAlchemy 事务管理影响
+        db_url = settings.database_url.replace("postgresql+asyncpg://", "postgresql://")
+        pg_conn = await asyncpg.connect(db_url)
+        try:
+            for step_name, sql in alter_type_sqls:
+                short = sql.strip()[:72]
+                try:
+                    await pg_conn.execute(sql)
+                    print(f"    ✓ {short}")
+                    success_count += 1
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if "already exists" in err_msg or "duplicate" in err_msg:
+                        print(f"    ⊘ 跳过 (已存在): {short}")
+                        skip_count += 1
+                    else:
+                        print(f"    ✗ 失败: {short}")
+                        print(f"      错误: {e}")
+                        fail_count += 1
+        finally:
+            await pg_conn.close()
+        print()
+
+    # ── Phase 2: 其余迁移 (事务模式) ──
+    print("[Phase 2] 常规迁移 (事务模式)")
     async with engine.begin() as conn:
         for idx, (name, sqls) in enumerate(MIGRATIONS, 1):
+            regular_sqls = [s for s in sqls if not is_alter_type_add_value(s)]
+            if not regular_sqls:
+                print(f"[{idx}/{total_steps}] {name}")
+                print(f"    ⊘ 已在 Phase 1 执行")
+                print()
+                continue
+
             print(f"[{idx}/{total_steps}] {name}")
             step_ok = True
 
-            for sql in sqls:
+            for sql in regular_sqls:
                 short = sql.strip().split("\n")[0][:72]
                 # 使用 SAVEPOINT 隔离每条 SQL，避免单条失败毒化整个事务
                 sp = await conn.begin_nested()
