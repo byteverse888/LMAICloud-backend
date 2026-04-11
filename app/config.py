@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     
     # App
-    app_name: str = "龙虾云"
+    app_name: str = "貔貅云"
     app_env: str = "development"
     debug: bool = True
     frontend_url: str = "http://localhost:3000"  # 前端地址，用于邮件中的链接
@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from_email: str = ""
-    smtp_from_name: str = "龙虾云"
+    smtp_from_name: str = ""  # 空则自动使用品牌配置中的平台名称
     smtp_use_tls: bool = True
     
     # 邮箱激活令牌过期时间（小时）

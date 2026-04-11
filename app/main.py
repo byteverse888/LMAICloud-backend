@@ -238,8 +238,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title=settings.app_name,
-    description="""
-## 龙虾云 GPU算力云平台 API
+    description=f"""
+## {settings.app_name} GPU算力云平台 API
 
 提供企业级GPU算力租用服务，支持以下功能：
 
@@ -264,7 +264,7 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
     contact={
-        "name": "龙虾云 Support",
+        "name": f"{settings.app_name} Support",
         "email": "support@lmaicloud.com",
     },
     license_info={
@@ -365,7 +365,7 @@ app.include_router(ws.router, tags=["WebSocket"])
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to 龙虾云 API", "version": "1.0.0"}
+    return {"message": f"Welcome to {settings.app_name} API", "version": "1.0.0"}
 
 
 @app.get("/health")

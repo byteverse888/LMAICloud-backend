@@ -12,8 +12,7 @@ from app.config import settings as app_settings
 
 router = APIRouter()
 
-# 默认值
-DEFAULT_SITE_NAME = "龙虾云"
+# 默认值从 config 统一获取
 DEFAULT_SITE_DESCRIPTION = "大模型AI算力云平台"
 
 SITE_INFO_KEYS = [
@@ -33,7 +32,7 @@ async def get_site_info(db: AsyncSession = Depends(get_db)):
     db_settings = {s.key: json.loads(s.value) for s in result.scalars().all()}
     
     return {
-        "site_name": db_settings.get("site_name", DEFAULT_SITE_NAME),
+        "site_name": db_settings.get("site_name", app_settings.app_name),
         "site_description": db_settings.get("site_description", DEFAULT_SITE_DESCRIPTION),
         "contact_email": db_settings.get("contact_email", "support@lmaicloud.com"),
         "site_logo": db_settings.get("site_logo", ""),
@@ -41,7 +40,7 @@ async def get_site_info(db: AsyncSession = Depends(get_db)):
         "icp_number": db_settings.get("icp_number", ""),
         "icp_link": db_settings.get("icp_link", "https://beian.miit.gov.cn/"),
         "police_number": db_settings.get("police_number", ""),
-        "copyright_text": db_settings.get("copyright_text", "© 2026 龙虾云. All rights reserved."),
+        "copyright_text": db_settings.get("copyright_text", ""),
         "captcha_enabled": db_settings.get("captcha_enabled", True),
         "announcement_text": db_settings.get("announcement_text", ""),
     }

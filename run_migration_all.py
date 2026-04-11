@@ -360,7 +360,7 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
            )""",
 
         """INSERT INTO system_settings (key, value, description) VALUES
-               ('site_name',          '"龙虾云"',                              '站点名称'),
+               ('site_name',          '"貔貅云"',                              '站点名称'),
                ('site_description',   '"大模型AI算力云平台"',                       '站点描述'),
                ('site_logo',          '""',                                       '站点Logo URL'),
                ('contact_email',      '"support@lmaicloud.com"',                  '客服邮箱'),
@@ -368,7 +368,7 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
                ('icp_number',         '""',                                       'ICP备案号'),
                ('icp_link',           '"https://beian.miit.gov.cn/"',             'ICP备案链接'),
                ('police_number',      '""',                                       '公安备案号'),
-               ('copyright_text',     '"© 2026 龙虾云. All rights reserved."', '版权信息'),
+               ('copyright_text',     '"© 2026 巴特星球. All rights reserved."', '版权信息'),
                ('captcha_enabled',    'true',                                     '是否启用登录验证码'),
                ('user_agreement',     '""',                                       '用户协议'),
                ('privacy_policy',     '""',                                       '隐私政策'),

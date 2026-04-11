@@ -251,7 +251,7 @@ async def create_payment(
             # 真实微信支付
             try:
                 wx_result = await _create_wechat_native_order(
-                    order_id, payment_data.amount, "龙虾云 账户充值"
+                    order_id, payment_data.amount, f"{settings.app_name} 账户充值"
                 )
                 qr_url = wx_result.get("code_url", "")
                 pay_url = qr_url

@@ -25,7 +25,7 @@ class EmailConfig:
         smtp_user: str = "",
         smtp_password: str = "",
         from_email: str = "",
-        from_name: str = "龙虾云",
+        from_name: str = "",
         use_tls: bool = True,
     ):
         self.smtp_host = smtp_host
@@ -64,7 +64,7 @@ async def get_email_config(db: Optional[AsyncSession] = None) -> EmailConfig:
                 select(SystemSetting).where(
                     SystemSetting.key.in_([
                         "smtp_host", "smtp_port", "smtp_user", "smtp_password",
-                        "smtp_from_email", "smtp_from_name", "smtp_use_tls"
+                        "smtp_from_email", "smtp_from_name", "smtp_use_tls", "site_name"
                     ])
                 )
             )
@@ -85,8 +85,16 @@ async def get_email_config(db: Optional[AsyncSession] = None) -> EmailConfig:
                 config.from_name = db_settings["smtp_from_name"]
             if "smtp_use_tls" in db_settings:
                 config.use_tls = db_settings["smtp_use_tls"]
+            
+            # 发件人名称为空时，自动回退到品牌配置中的平台名称
+            if not config.from_name and db_settings.get("site_name"):
+                config.from_name = db_settings["site_name"]
         except Exception as e:
             logger.warning(f"从数据库读取邮件配置失败: {e}")
+    
+    # 最终回退：若仍然为空，使用 config.py 中的 app_name
+    if not config.from_name:
+        config.from_name = settings.app_name
     
     return config
 
@@ -192,7 +200,7 @@ def send_email_sync(
 def generate_activation_email_html(
     user_email: str,
     activation_link: str,
-    site_name: str = "龙虾云",
+    site_name: str = "",
     expire_hours: int = 24
 ) -> tuple[str, str]:
     """
@@ -283,7 +291,7 @@ async def send_activation_email(
     db: AsyncSession,
     to_email: str,
     activation_token: str,
-    site_name: str = "龙虾云",
+    site_name: str = "",
     expire_hours: int = 24
 ) -> bool:
     """发送激活邮件"""
@@ -313,7 +321,7 @@ async def send_activation_email(
 
 def generate_password_reset_email_html(
     activation_link: str,
-    site_name: str = "龙虾云",
+    site_name: str = "",
     expire_minutes: int = 30
 ) -> tuple[str, str]:
     """生成密码重置邮件的HTML和纯文本内容"""
@@ -379,7 +387,7 @@ async def send_password_reset_email(
     db: AsyncSession,
     to_email: str,
     reset_token: str,
-    site_name: str = "龙虾云",
+    site_name: str = "",
     expire_minutes: int = 30
 ) -> bool:
     """发送密码重置邮件"""
@@ -405,14 +413,14 @@ async def send_test_email(db: AsyncSession, to_email: str) -> tuple[bool, Option
     <div style="font-family: Arial, sans-serif; padding: 20px;">
         <h2>邮件服务测试</h2>
         <p>如果您收到这封邮件，说明邮件服务配置正确！</p>
-        <p style="color: #666;">— 龙虾云 系统</p>
+        <p style="color: #666;">— {settings.app_name} 系统</p>
     </div>
     """
     
     return send_email_sync(
         config=config,
         to_email=to_email,
-        subject="【龙虾云】邮件服务测试",
+        subject=f"【{settings.app_name}】邮件服务测试",
         html_content=html_content,
         text_content="邮件服务测试\n\n如果您收到这封邮件，说明邮件服务配置正确！"
     )
