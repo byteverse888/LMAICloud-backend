@@ -77,19 +77,3 @@ async def get_logo(filename: str):
         headers={"Cache-Control": "public, max-age=86400"},
     )
 
-
-@router.get("/agreements")
-async def get_agreements(db: AsyncSession = Depends(get_db)):
-    """获取用户协议/隐私政策等（公开）"""
-    agreement_keys = ["user_agreement", "privacy_policy", "service_agreement", "recharge_agreement"]
-    result = await db.execute(select(SystemSetting).where(
-        SystemSetting.key.in_(agreement_keys)
-    ))
-    db_settings = {s.key: json.loads(s.value) for s in result.scalars().all()}
-
-    return {
-        "user_agreement": db_settings.get("user_agreement", ""),
-        "privacy_policy": db_settings.get("privacy_policy", ""),
-        "service_agreement": db_settings.get("service_agreement", ""),
-        "recharge_agreement": db_settings.get("recharge_agreement", ""),
-    }

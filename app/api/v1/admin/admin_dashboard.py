@@ -68,6 +68,12 @@ async def get_dashboard_stats(
         .where(Order.status == OrderStatus.PAID, Order.type != OrderType.RECHARGE, Order.created_at >= today_start)
     )).scalar() or 0
 
+    # 本月消费
+    month_expense = (await db.execute(
+        select(func.coalesce(func.sum(Order.amount), 0))
+        .where(Order.status == OrderStatus.PAID, Order.type != OrderType.RECHARGE, Order.created_at >= month_start)
+    )).scalar() or 0
+
     # 今日新增用户
     today_new_users = (await db.execute(
         select(func.count(AIUser.id)).where(AIUser.created_at >= today_start)
@@ -91,7 +97,7 @@ async def get_dashboard_stats(
     ]
 
     return {
-        "clusters": 1,
+        "clusters": 1 if k8s.is_connected else 0,
         "nodes": total_nodes,
         "users": user_count,
         "instances": total_instances,
@@ -103,6 +109,7 @@ async def get_dashboard_stats(
         "today_revenue": float(today_income),
         "month_revenue": float(month_income),
         "today_expense": float(today_expense),
+        "month_expense": float(month_expense),
         "today_new_users": today_new_users,
         "activities": activities,
     }

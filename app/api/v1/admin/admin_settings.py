@@ -17,87 +17,6 @@ from app.config import settings as app_settings
 
 router = APIRouter()
 
-# ========== 协议默认内容 ==========
-_DEFAULT_USER_AGREEMENT = (
-    '<h2>用户协议</h2>'
-    '<p>欢迎使用本平台（以下简称"平台"）。请您在使用前仔细阅读本协议。注册或使用本平台即表示您同意以下条款。</p>'
-    '<h3>一、服务说明</h3>'
-    '<p>本平台为用户提供大模型AI算力云服务，包括但不限于GPU实例创建、镜像管理、模型训练与推理等功能。平台有权根据业务需要调整服务内容并提前通知用户。</p>'
-    '<h3>二、账户注册与安全</h3>'
-    '<p>1. 用户须使用真实有效的邮箱注册账户，并妥善保管账户密码。<br/>2. 因用户自身原因导致的账户泄露或被盗，平台不承担责任。<br/>3. 用户不得将账户转让、借用或出售给第三方。</p>'
-    '<h3>三、使用规范</h3>'
-    '<p>用户在使用平台时须遵守以下规范：<br/>1. 不得利用平台从事违法违规活动；<br/>2. 不得干扰平台正常运行或攻击平台系统；<br/>3. 不得上传或传播含有恶意代码的文件；<br/>4. 不得利用平台资源进行加密货币挖矿；<br/>5. 合理使用平台资源，不得恶意占用。</p>'
-    '<h3>四、知识产权</h3>'
-    '<p>平台上的所有内容（包括但不限于文字、图片、代码、界面设计）的知识产权归平台所有。用户在平台上创建的模型和数据，其知识产权归用户所有。</p>'
-    '<h3>五、免责声明</h3>'
-    '<p>1. 因不可抗力导致的服务中断，平台不承担责任；<br/>2. 用户因自身操作不当导致的数据丢失，平台不承担责任；<br/>3. 平台不对用户使用服务产生的结果承担担保责任。</p>'
-    '<h3>六、协议变更</h3>'
-    '<p>平台有权根据需要修改本协议，修改后的协议将在平台公示。用户继续使用平台即视为同意修改后的协议。</p>'
-)
-
-_DEFAULT_PRIVACY_POLICY = (
-    '<h2>隐私政策</h2>'
-    '<p>本平台重视用户隐私保护。本政策说明我们如何收集、使用和保护您的个人信息。</p>'
-    '<h3>一、信息收集</h3>'
-    '<p>我们可能收集以下信息：<br/>1. 注册信息：邮箱地址、用户名等；<br/>2. 使用信息：登录记录、操作日志、实例使用情况；<br/>3. 支付信息：充值记录、交易流水（不存储银行卡号等敏感信息）；<br/>4. 设备信息：浏览器类型、IP地址等。</p>'
-    '<h3>二、信息使用</h3>'
-    '<p>收集的信息用于：<br/>1. 提供和改善平台服务；<br/>2. 账户管理和身份验证；<br/>3. 发送服务通知和系统公告；<br/>4. 安全风控和防止欺诈；<br/>5. 数据分析和服务优化。</p>'
-    '<h3>三、信息保护</h3>'
-    '<p>1. 我们采用行业标准的安全措施保护用户数据；<br/>2. 用户密码经过加密存储，任何人无法获取明文；<br/>3. 严格限制员工访问用户数据的权限；<br/>4. 定期进行安全审计和漏洞扫描。</p>'
-    '<h3>四、Cookie 使用</h3>'
-    '<p>本平台使用Cookie和类似技术来维持用户会话和改善使用体验。您可以通过浏览器设置管理Cookie偏好。</p>'
-    '<h3>五、信息共享</h3>'
-    '<p>我们不会向第三方出售用户个人信息。仅在以下情况可能共享：<br/>1. 获得用户明确同意；<br/>2. 法律法规要求；<br/>3. 与关联公司共享以提供服务（受同等保护措施约束）。</p>'
-    '<h3>六、用户权利</h3>'
-    '<p>您有权：<br/>1. 查询和更正您的个人信息；<br/>2. 删除您的账户和相关数据；<br/>3. 撤回授权同意；<br/>4. 对个人信息处理提出异议。<br/>如需行使上述权利，请联系客服邮箱。</p>'
-)
-
-_DEFAULT_SERVICE_AGREEMENT = (
-    '<h2>产品服务协议</h2>'
-    '<p>本协议规定了平台向用户提供产品和服务的具体条款。</p>'
-    '<h3>一、服务范围</h3>'
-    '<p>本平台提供以下服务：<br/>1. GPU云实例：按需创建和管理GPU计算实例；<br/>2. 镜像服务：提供预置和自定义镜像管理；<br/>3. 存储服务：提供数据存储和管理功能；<br/>4. 应用市场：提供预置AI应用和模型部署。</p>'
-    '<h3>二、计费规则</h3>'
-    '<p>1. 按量计费：根据实际使用时长和资源规格计费，最小计费单位为1小时；<br/>2. 套餐计费：用户可购买月卡等套餐享受优惠；<br/>3. 余额充值：支持微信支付等方式充值，充值后不可提现；<br/>4. 欠费处理：账户余额不足时，运行中的实例将被自动停止。</p>'
-    '<h3>三、退款政策</h3>'
-    '<p>1. 账户余额不支持退款提现；<br/>2. 因平台原因导致的服务不可用，将按实际影响时长进行补偿；<br/>3. 套餐类产品一经购买不支持退款。</p>'
-    '<h3>四、服务保障（SLA）</h3>'
-    '<p>1. 平台承诺月度服务可用性不低于99.5%；<br/>2. 计划内维护将提前24小时通知用户；<br/>3. 非计划停机将在发现后第一时间通知用户并尽快恢复；<br/>4. 因SLA未达标造成的损失，将根据影响程度给予账户余额补偿。</p>'
-    '<h3>五、数据安全</h3>'
-    '<p>1. 用户数据存储在安全的基础设施上；<br/>2. 平台不主动访问用户实例内的数据；<br/>3. 实例释放后，相关数据将在7天内彻底删除；<br/>4. 建议用户定期备份重要数据。</p>'
-    '<h3>六、违约责任</h3>'
-    '<p>1. 用户违反使用规范，平台有权暂停或终止服务；<br/>2. 因用户违规导致平台损失的，用户应承担赔偿责任；<br/>3. 因平台原因导致用户损失的，赔偿上限为用户最近12个月支付的费用总额。</p>'
-)
-
-_DEFAULT_RECHARGE_AGREEMENT = (
-    '<h2>用户充值协议</h2>'
-    '<p>本协议是您与平台之间关于账户充值服务的法律协议。在您使用充值服务前，请仔细阅读以下条款。</p>'
-    '<h3>一、充值规则</h3>'
-    '<p>1. 用户可通过平台支持的支付方式（如微信支付）向账户充值；<br/>'
-    '2. 最低充值金额为人民币1元，最高充值金额为人民币50000元；<br/>'
-    '3. 充值成功后，充值金额将实时到账，可用于平台内各项服务消费。</p>'
-    '<h3>二、充值使用</h3>'
-    '<p>1. 充值金额仅可用于购买平台提供的服务，包括但不限于GPU实例租用、存储服务等；<br/>'
-    '2. 充值金额不可转让给其他用户；<br/>'
-    '3. 账户余额将按照平台计费规则自动扣除相应费用。</p>'
-    '<h3>三、退款政策</h3>'
-    '<p>1. 账户充值金额一经充值成功，原则上不支持退款提现；<br/>'
-    '2. 因平台原因导致服务不可用的，将根据实际影响时长进行账户余额补偿；<br/>'
-    '3. 如有特殊情况需要退款，请联系平台客服处理。</p>'
-    '<h3>四、账户安全</h3>'
-    '<p>1. 请妥善保管账户密码，因个人原因导致的资金损失由用户自行承担；<br/>'
-    '2. 如发现账户异常或未授权的交易，请立即联系客服处理；<br/>'
-    '3. 平台有权对异常充值行为进行风险控制。</p>'
-    '<h3>五、争议解决</h3>'
-    '<p>1. 因充值产生的争议，双方应友好协商解决；<br/>'
-    '2. 协商不成的，任何一方均可向平台所在地有管辖权的人民法院提起诉讼；<br/>'
-    '3. 本协议的最终解释权归平台所有。</p>'
-    '<h3>六、协议生效与修改</h3>'
-    '<p>1. 用户完成充值操作即视为同意本协议全部条款；<br/>'
-    '2. 平台有权根据业务发展需要修改本协议，修改后的协议将在平台公示；<br/>'
-    '3. 用户继续使用充值服务即视为接受修改后的协议。</p>'
-)
-
 # 默认设置值（品牌名统一从 config.app_name 获取）
 DEFAULT_SETTINGS: Dict[str, Any] = {
     "site_name": app_settings.app_name,
@@ -130,11 +49,6 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "icp_link": "https://beian.miit.gov.cn/",
     "police_number": "",
     "copyright_text": "",
-    # 协议
-    "user_agreement": _DEFAULT_USER_AGREEMENT,
-    "privacy_policy": _DEFAULT_PRIVACY_POLICY,
-    "service_agreement": _DEFAULT_SERVICE_AGREEMENT,
-    "recharge_agreement": _DEFAULT_RECHARGE_AGREEMENT,
     # 验证码
     "captcha_enabled": True,
     # 公告
@@ -166,10 +80,6 @@ class SystemSettingsUpdate(BaseModel):
     icp_link: Optional[str] = None
     police_number: Optional[str] = None
     copyright_text: Optional[str] = None
-    # 协议
-    user_agreement: Optional[str] = None
-    privacy_policy: Optional[str] = None
-    service_agreement: Optional[str] = None
     # 验证码
     captcha_enabled: Optional[bool] = None
     # 公告
@@ -361,7 +271,7 @@ async def get_email_config_api(
         "smtp_user": settings.get("smtp_user", ""),
         "smtp_password": "******" if settings.get("smtp_password") else "",  # 密码不返回明文
         "smtp_from_email": settings.get("smtp_from_email", ""),
-        "smtp_from_name": settings.get("smtp_from_name", app_settings.app_name),
+        "smtp_from_name": settings.get("smtp_from_name", ""),
         "smtp_use_tls": settings.get("smtp_use_tls", True),
         "notification_enabled": settings.get("notification_email_enabled", True),
         "verification_required": settings.get("email_verification_required", True),
@@ -392,7 +302,7 @@ async def update_email_config_api(
             "smtp_port": settings.get("smtp_port", 587),
             "smtp_user": settings.get("smtp_user", ""),
             "smtp_from_email": settings.get("smtp_from_email", ""),
-            "smtp_from_name": settings.get("smtp_from_name", app_settings.app_name),
+            "smtp_from_name": settings.get("smtp_from_name", ""),
             "smtp_use_tls": settings.get("smtp_use_tls", True),
             "notification_enabled": settings.get("notification_email_enabled", True),
             "verification_required": settings.get("email_verification_required", True),
