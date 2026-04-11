@@ -727,9 +727,8 @@ async def settle_instance_billing(
     fk = {"instance_id": instance.id} if instance_type == "gpu" else {"openclaw_instance_id": instance.id}
     res_name = getattr(instance, 'name', None) or str(instance.id)[:8]
     # 构造描述：包含计费区间和单价
-    period_desc = f"{instance.last_billed_at.strftime('%m/%d %H:%M')}~{now.strftime('%H:%M')}"
-    duration_min = duration // 60
-    desc = f"{res_name} {reason} {period_desc} ¥{hourly_price:.2f}/时 × {duration_min}分钟"
+    period_desc = f"{instance.last_billed_at.strftime('%m/%d %H:%M')}~{now.strftime('%m/%d %H:%M')}"
+    desc = f"{reason} {period_desc} ¥{hourly_price:.2f}/时"
     record = BillingRecord(
         user_id=user.id,
         amount=amount,

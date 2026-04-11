@@ -18,6 +18,7 @@ from app.database import get_db, AsyncSessionLocal
 from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus, OpenClawInstance
 from app.schemas import (
     InstanceCreate, InstanceResponse, ResourceConfigResponse, PaginatedResponse,
+    InstanceRename,
 )
 from app.utils.auth import get_current_user
 from app.services.k8s_client import get_k8s_client
@@ -418,8 +419,8 @@ async def create_instance(
         if current_user.balance < period_price:
             raise HTTPException(status_code=400, detail="{}需要 ¥{:.2f}，余额不足".format(billing_label, period_price))
     else:
-        if current_user.balance < unit_price:
-            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{unit_price:.2f}")
+        if current_user.balance <= 0:
+            raise HTTPException(status_code=400, detail=f"余额不足，请充值后再创建按量计费实例")
 
     # 镜像：优先用前端传来的 image_url，其次从 app_images 表查找
     image_url = instance_data.image_url
@@ -768,9 +769,9 @@ async def start_instance(
                     detail="订阅已过期且余额不足续费，需要 ¥{:.2f}".format(renew_price)
                 )
     else:
-        # 按量计费：至少够1小时费用
-        if current_user.balance < instance.hourly_price:
-            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{instance.hourly_price:.2f}")
+        # 按量计费：余额必须大于 0
+        if current_user.balance <= 0:
+            raise HTTPException(status_code=400, detail=f"余额不足，请充值后再启动按量计费实例")
 
     pod_manager = get_pod_manager()
     inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
@@ -833,6 +834,62 @@ async def start_instance(
 
     background_tasks.add_task(wait_for_running, instance.id, current_user.id)
     return {"message": "实例启动中"}
+
+
+@router.patch("/{instance_id}/rename")
+async def rename_instance(
+    instance_id: str,
+    req: InstanceRename,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改实例名称"""
+    result = await db.execute(
+        select(Instance).where(
+            Instance.id == instance_id,
+            Instance.user_id == current_user.id,
+        )
+    )
+    instance = result.scalar_one_or_none()
+    if not instance:
+        raise HTTPException(status_code=404, detail="实例不存在")
+
+    old_name = instance.name
+    new_name = req.name.strip()
+    instance.name = new_name
+    await db.commit()
+
+    # 同步更新 K8s Deployment annotation
+    try:
+        k8s = get_k8s_client()
+        short_id = str(instance.id)[:8]
+        deploy_name = f"inst-{short_id}"
+        inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+        patch_body = {
+            "metadata": {
+                "annotations": {"lmaicloud/instance-name": new_name}
+            },
+        }
+        await asyncio.to_thread(k8s.update_deployment, deploy_name, inst_ns, patch_body)
+    except Exception as e:
+        logger.warning(f"同步 K8s Deployment 名称失败(已忽略): {e}")
+
+    # 审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.UPDATE, AuditResourceType.INSTANCE,
+            resource_id=str(instance.id), resource_name=instance.name,
+            detail=f"修改名称: {old_name} -> {instance.name}",
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"记录修改名称日志失败: {e}")
+
+    return {"message": "名称已修改", "name": instance.name}
 
 
 @router.post("/{instance_id}/stop")

@@ -82,7 +82,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
     - monthly/yearly: 到期后自动续费或停机，写入 orders
     """
     from app.database import AsyncSessionLocal
-    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus, InstanceStatus, BillingRecord
+    from app.models import Instance, OpenClawInstance, User, Order, OrderType, OrderStatus, InstanceStatus, BillingRecord, Notification, NotificationType
     from sqlalchemy import select
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
@@ -204,20 +204,11 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
 
         charge_amount = round(hourly_price * duration / 3600, 4)
 
-        # 余额不足检查
-        if user.balance < charge_amount:
-            print(f"[BILLING] User {user.id} balance insufficient: {user.balance} < {charge_amount}")
-            if user.balance < -10:
-                instance.status = InstanceStatus.EXPIRED
-                instance.last_billed_at = None
-                await session.commit()
-                return {"status": "expired", "reason": "balance too low"}
-
+        # 先正常扣费（允许欠费）
         user.balance -= charge_amount
         # 构造描述：包含计费区间和单价
-        period_desc = f"{last_billed.strftime('%m/%d %H:%M')}~{now.strftime('%H:%M')}"
-        duration_min = duration // 60
-        desc = f"{res_name} 按量计费 {period_desc} ¥{hourly_price:.2f}/时 × {duration_min}分钟"
+        period_desc = f"{last_billed.strftime('%m/%d %H:%M')}~{now.strftime('%m/%d %H:%M')}"
+        desc = f"按量计费 {period_desc} ¥{hourly_price:.2f}/时"
 
         record = BillingRecord(
             user_id=user.id,
@@ -233,10 +224,52 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         )
         session.add(record)
         instance.last_billed_at = now  # 更新计费时间点
+
+        # 欠费检查：最高允许欠费 10 元
+        billing_result = "processed"
+        if user.balance <= -10:
+            # 欠费超过 10 元 → 强制关机
+            print(f"[BILLING] User {user.id} debt {user.balance:.2f} >= 10, force stopping {instance_type} {instance_id}")
+            try:
+                if instance_type == "openclaw":
+                    from app.services.openclaw_manager import get_openclaw_manager
+                    mgr = get_openclaw_manager()
+                    await asyncio.to_thread(mgr.stop_instance, str(instance.id), instance.namespace)
+                    instance.status = "stopped"
+                else:
+                    from app.services.pod_manager import PodManager, get_pod_manager
+                    pm = get_pod_manager()
+                    inst_ns = instance.namespace or PodManager.user_namespace(str(instance.user_id))
+                    await asyncio.to_thread(pm.stop_instance, str(instance.id), inst_ns)
+                    instance.status = InstanceStatus.STOPPED
+                instance.last_billed_at = None
+                billing_result = "force_stopped"
+            except Exception as e:
+                print(f"[BILLING] Force stop failed for {instance_type} {instance_id}: {e}")
+
+            # 发送强制关机通知
+            notification = Notification(
+                user_id=user.id,
+                title="欠费强制关机通知",
+                content=f"您的实例「{res_name}」因账户欠费超过 10 元（当前余额 ¥{user.balance:.2f}）已被强制关机。请尽快充值以恢复服务。",
+                type=NotificationType.BILLING,
+            )
+            session.add(notification)
+        elif user.balance < 0:
+            # 欠费但未超 10 元 → 发送警告通知
+            print(f"[BILLING] User {user.id} balance negative: {user.balance:.2f}, sending warning")
+            notification = Notification(
+                user_id=user.id,
+                title="余额不足提醒",
+                content=f"您的账户余额已不足（当前 ¥{user.balance:.2f}），按量计费实例「{res_name}」仍在运行中。欠费超过 10 元将自动关机，请及时充值。",
+                type=NotificationType.BILLING,
+            )
+            session.add(notification)
+
         await session.commit()
 
         return {
-            "status": "processed",
+            "status": billing_result,
             "instance_id": instance_id,
             "amount": charge_amount,
             "duration_seconds": duration,
@@ -248,7 +281,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
 async def process_all_billing_task(ctx: dict) -> dict:
     """
     定时任务: 处理所有运行中实例的计费（GPU + OpenClaw）
-    cron 每 5 分钟直接执行，不再有内部门控。
+    cron 每 15 分钟直接执行，不再有内部门控。
     """
     from app.database import AsyncSessionLocal
     from app.models import Instance, OpenClawInstance
@@ -1047,8 +1080,8 @@ class WorkerSettings:
     cron_jobs = [
         # 每30秒同步实例状态（K8s → DB）
         cron(sync_instance_status_task, second={0, 30}, unique=True, timeout=25),
-        # 每5分钟检查计费（实际间隔由 billing_interval_minutes 配置控制）
-        cron(process_all_billing_task, minute={0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55}, unique=True, timeout=120),
+        # 每15分钟检查计费
+        cron(process_all_billing_task, minute={0, 15, 30, 45}, unique=True, timeout=120),
         # 每小时清理过期实例
         cron(cleanup_expired_instances_task, minute=5),
         # 每天凌晨2点生成报表

@@ -24,6 +24,7 @@ from app.schemas import (
     ChannelCreate, ChannelUpdate, ChannelResponse,
     SkillInstall, SkillUpdate, SkillResponse,
     MonitorModelResponse, MonitorChannelResponse, MonitorStatusResponse,
+    InstanceRename,
 )
 from app.utils.auth import get_current_user
 from app.services.openclaw_manager import get_openclaw_manager, OpenClawManager
@@ -156,9 +157,8 @@ async def create_instance(
                 detail=f"余额不足，需要 ¥{first_charge:.2f}，当前余额 ¥{current_user.balance:.2f}"
             )
     else:
-        min_balance = hourly_price  # 至少夨1小时
-        if current_user.balance < min_balance:
-            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+        if current_user.balance <= 0:
+            raise HTTPException(status_code=400, detail="余额不足，请充值后再创建按量计费实例")
 
     # ── 边缘节点必须指定 node_name ──
     if req.node_type == "edge" and not req.node_name:
@@ -259,6 +259,7 @@ async def create_instance(
         edge_storage_path=settings.openclaw_edge_storage_path,
         model_keys=init_model_keys if init_model_keys else None,
         channels=init_channels if init_channels else None,
+        instance_name=req.name,
     )
 
     if not k8s_result.get("success"):
@@ -449,6 +450,54 @@ async def get_instance(
     return resp
 
 
+@router.patch("/instances/{instance_id}/rename")
+async def rename_instance(
+    instance_id: UUID,
+    req: InstanceRename,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """修改 OpenClaw 实例名称"""
+    inst = await _get_instance_or_404(instance_id, current_user, db)
+    old_name = inst.name
+    new_name = req.name.strip()
+    inst.name = new_name
+    await db.commit()
+
+    # 同步更新 K8s Deployment annotation
+    try:
+        from app.services.k8s_client import get_k8s_client
+        k8s = get_k8s_client()
+        deploy_name = f"oc-{str(inst.id).replace('-', '')[:8]}-deploy"
+        patch_body = {
+            "metadata": {
+                "annotations": {"lmaicloud/instance-name": new_name}
+            },
+        }
+        await asyncio.to_thread(k8s.update_deployment, deploy_name, inst.namespace, patch_body)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"同步 K8s Deployment 名称失败(已忽略): {e}")
+
+    # 审计日志
+    try:
+        from app.api.v1.audit_log import create_audit_log, get_client_ip
+        from app.models import AuditAction, AuditResourceType
+        await create_audit_log(
+            db, current_user.id, AuditAction.UPDATE, AuditResourceType.OPENCLAW,
+            resource_id=str(inst.id), resource_name=inst.name,
+            detail=f"修改名称: {old_name} -> {inst.name}",
+            ip_address=get_client_ip(request),
+        )
+        await db.commit()
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"记录修改名称日志失败: {e}")
+
+    return {"message": "名称已修改", "name": inst.name}
+
+
 @router.delete("/instances/{instance_id}")
 async def delete_instance(
     instance_id: UUID,
@@ -521,10 +570,9 @@ async def start_instance(
         if inst.expired_at and datetime.utcnow() > inst.expired_at:
             raise HTTPException(status_code=400, detail="实例已过期，请先续费")
     else:
-        # 按量：至少夨1小时
-        min_balance = inst.hourly_price or settings.default_gpu_hourly_price
-        if current_user.balance < min_balance:
-            raise HTTPException(status_code=400, detail=f"余额不足，至少需要 ¥{min_balance:.2f}")
+        # 按量计费：余额必须大于 0
+        if current_user.balance <= 0:
+            raise HTTPException(status_code=400, detail="余额不足，请充值后再启动按量计费实例")
 
     mgr = get_openclaw_manager()
     ok = await asyncio.to_thread(mgr.start_instance, str(inst.id), inst.namespace)

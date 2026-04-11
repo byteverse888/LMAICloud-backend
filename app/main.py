@@ -21,6 +21,7 @@ from app.api.v1 import tickets, system, points, referral, audit_log, notificatio
 from app.api.v1.admin import clusters, nodes, admin_users, admin_orders, reports, admin_settings, admin_images, admin_tickets
 from app.api.v1.admin import admin_services, admin_deployments, admin_pods, admin_storage
 from app.api.v1.admin import admin_openclaw, admin_dashboard, admin_market, admin_public_data, admin_notifications, admin_referral
+from app.api.v1.admin import admin_workloads
 
 # 初始化日志系统
 logger = setup_logging()
@@ -356,6 +357,7 @@ app.include_router(admin_market.router, prefix="/api/v1/admin/market", tags=["�
 app.include_router(admin_notifications.router, prefix="/api/v1/admin/notifications", tags=["管理-通知"])
 app.include_router(admin_referral.router, prefix="/api/v1/admin/referral", tags=["管理-推广"])
 app.include_router(admin_public_data.router, prefix="/api/v1/admin/public-data", tags=["管理-公开数据"])
+app.include_router(admin_workloads.router, prefix="/api/v1/admin/workloads", tags=["管理-工作负载"])
 
 # WebSocket routes
 app.include_router(ws.router, tags=["WebSocket"])

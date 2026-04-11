@@ -273,6 +273,11 @@ class InstanceRenew(BaseModel):
     billing_type: str = "hourly"  # hourly/daily/weekly/monthly
 
 
+# Instance Rename Schema
+class InstanceRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64, description="新实例名称")
+
+
 # Payment Schemas
 class PaymentCreate(BaseModel):
     amount: float

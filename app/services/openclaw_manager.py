@@ -304,6 +304,7 @@ class OpenClawManager:
         node_name: Optional[str] = None,
         node_type: str = "center",
         model_keys: Optional[List[Dict[str, Any]]] = None,
+        instance_name: str = "",
     ) -> Dict[str, Any]:
         """
         构建 OpenClaw Deployment（对齐官方 deployment.yaml 结构）。
@@ -505,6 +506,7 @@ class OpenClawManager:
                 "namespace": namespace,
                 "labels": labels,
                 "annotations": {
+                    "lmaicloud/instance-name": instance_name,
                     "openclaw/created-at": datetime.utcnow().isoformat(),
                     "openclaw/node-type": node_type,
                 },
@@ -514,7 +516,12 @@ class OpenClawManager:
                 "strategy": {"type": "Recreate"},
                 "selector": {"matchLabels": {"openclaw-instance": str(instance_id)}},
                 "template": {
-                    "metadata": {"labels": labels},
+                    "metadata": {
+                        "labels": labels,
+                        "annotations": {
+                            "lmaicloud/instance-name": instance_name,
+                        },
+                    },
                     "spec": pod_spec,
                 },
             },
@@ -537,6 +544,7 @@ class OpenClawManager:
         channels: Optional[List[Dict]] = None,
         storage_class: str = "standard",
         edge_storage_path: str = "/opt/openclaw-data",
+        instance_name: str = "",
     ) -> Dict[str, Any]:
         """
         创建 OpenClaw 实例 — 按顺序创建全套 K8s 资源。
@@ -578,6 +586,7 @@ class OpenClawManager:
             dep_spec = self.build_deployment(
                 instance_id, ns, image_url, port, cpu_cores, memory_gb, node_name, node_type,
                 model_keys=model_keys,
+                instance_name=instance_name,
             )
             dep_name = self.k8s.create_deployment(ns, dep_spec)
             if not dep_name:

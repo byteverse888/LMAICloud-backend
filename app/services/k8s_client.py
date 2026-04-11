@@ -1139,7 +1139,393 @@ class K8sClient:
             print(f"[K8s] Error listing warning events: {e}")
             return []
 
+    # ========== DaemonSet 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_daemon_sets(self, namespace: str = "default", label_selector: Optional[str] = None,
+                         all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 DaemonSet 列表"""
+        if not self._initialized:
+            return []
+        try:
+            kwargs = {}
+            if label_selector:
+                kwargs["label_selector"] = label_selector
+            if all_namespaces:
+                ds_list = self.apps_v1.list_daemon_set_for_all_namespaces(**kwargs)
+            else:
+                ds_list = self.apps_v1.list_namespaced_daemon_set(namespace, **kwargs)
+            return [self._parse_daemon_set(ds) for ds in ds_list.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing DaemonSets: {e}")
+            return []
+
+    def delete_daemon_set(self, name: str, namespace: str = "default") -> bool:
+        """删除 DaemonSet"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting DaemonSet {name}: {e}")
+            return False
+
+    def restart_daemon_set(self, name: str, namespace: str) -> bool:
+        """滚动重启 DaemonSet"""
+        if not self._initialized:
+            return False
+        try:
+            import datetime
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            body = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kubectl.kubernetes.io/restartedAt": now
+                            }
+                        }
+                    }
+                }
+            }
+            self.apps_v1.patch_namespaced_daemon_set(name, namespace, body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error restarting DaemonSet {name}: {e}")
+            return False
+
+    def _parse_daemon_set(self, ds) -> Dict[str, Any]:
+        """解析 DaemonSet 对象"""
+        images = []
+        if ds.spec.template and ds.spec.template.spec:
+            for c in ds.spec.template.spec.containers:
+                images.append(c.image)
+        conditions = []
+        if ds.status.conditions:
+            for cond in ds.status.conditions:
+                conditions.append({
+                    "type": cond.type,
+                    "status": cond.status,
+                    "reason": cond.reason,
+                    "message": cond.message,
+                })
+        annotations = ds.metadata.annotations or {}
+        return {
+            "name": ds.metadata.name,
+            "namespace": ds.metadata.namespace,
+            "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "desired_number_scheduled": ds.status.desired_number_scheduled or 0,
+            "current_number_scheduled": ds.status.current_number_scheduled or 0,
+            "number_ready": ds.status.number_ready or 0,
+            "number_available": ds.status.number_available or 0,
+            "number_misscheduled": ds.status.number_misscheduled or 0,
+            "updated_number_scheduled": ds.status.updated_number_scheduled or 0,
+            "labels": ds.metadata.labels or {},
+            "images": images,
+            "conditions": conditions,
+            "created_at": ds.metadata.creation_timestamp.isoformat() if ds.metadata.creation_timestamp else None,
+        }
+
+    # ========== StatefulSet 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_stateful_sets(self, namespace: str = "default", label_selector: Optional[str] = None,
+                           all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 StatefulSet 列表"""
+        if not self._initialized:
+            return []
+        try:
+            kwargs = {}
+            if label_selector:
+                kwargs["label_selector"] = label_selector
+            if all_namespaces:
+                ss_list = self.apps_v1.list_stateful_set_for_all_namespaces(**kwargs)
+            else:
+                ss_list = self.apps_v1.list_namespaced_stateful_set(namespace, **kwargs)
+            return [self._parse_stateful_set(ss) for ss in ss_list.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing StatefulSets: {e}")
+            return []
+
+    def delete_stateful_set(self, name: str, namespace: str = "default") -> bool:
+        """删除 StatefulSet"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.delete_namespaced_stateful_set(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting StatefulSet {name}: {e}")
+            return False
+
+    def scale_stateful_set(self, name: str, namespace: str, replicas: int) -> bool:
+        """调整 StatefulSet 副本数"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.patch_namespaced_stateful_set_scale(
+                name, namespace, {"spec": {"replicas": replicas}}
+            )
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error scaling StatefulSet {name}: {e}")
+            return False
+
+    def restart_stateful_set(self, name: str, namespace: str) -> bool:
+        """滚动重启 StatefulSet"""
+        if not self._initialized:
+            return False
+        try:
+            import datetime
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            body = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kubectl.kubernetes.io/restartedAt": now
+                            }
+                        }
+                    }
+                }
+            }
+            self.apps_v1.patch_namespaced_stateful_set(name, namespace, body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error restarting StatefulSet {name}: {e}")
+            return False
+
+    def _parse_stateful_set(self, ss) -> Dict[str, Any]:
+        """解析 StatefulSet 对象"""
+        images = []
+        if ss.spec.template and ss.spec.template.spec:
+            for c in ss.spec.template.spec.containers:
+                images.append(c.image)
+        conditions = []
+        if ss.status.conditions:
+            for cond in ss.status.conditions:
+                conditions.append({
+                    "type": cond.type,
+                    "status": cond.status,
+                    "reason": cond.reason,
+                    "message": cond.message,
+                })
+        annotations = ss.metadata.annotations or {}
+        return {
+            "name": ss.metadata.name,
+            "namespace": ss.metadata.namespace,
+            "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "replicas": ss.spec.replicas or 0,
+            "ready_replicas": ss.status.ready_replicas or 0,
+            "current_replicas": ss.status.current_replicas or 0,
+            "updated_replicas": ss.status.updated_replicas or 0,
+            "labels": ss.metadata.labels or {},
+            "images": images,
+            "conditions": conditions,
+            "service_name": ss.spec.service_name or "",
+            "update_strategy": ss.spec.update_strategy.type if ss.spec.update_strategy else "RollingUpdate",
+            "created_at": ss.metadata.creation_timestamp.isoformat() if ss.metadata.creation_timestamp else None,
+        }
+
     # ========== StorageClass 管理 ==========
+
+    # ========== DaemonSet 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_daemon_sets(self, namespace: str = "default", label_selector: Optional[str] = None,
+                         all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 DaemonSet 列表"""
+        if not self._initialized:
+            return []
+        try:
+            kwargs = {}
+            if label_selector:
+                kwargs["label_selector"] = label_selector
+            if all_namespaces:
+                ds_list = self.apps_v1.list_daemon_set_for_all_namespaces(**kwargs)
+            else:
+                ds_list = self.apps_v1.list_namespaced_daemon_set(namespace, **kwargs)
+            return [self._parse_daemon_set(ds) for ds in ds_list.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing DaemonSets: {e}")
+            return []
+
+    def delete_daemon_set(self, name: str, namespace: str = "default") -> bool:
+        """删除 DaemonSet"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.delete_namespaced_daemon_set(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting DaemonSet {name}: {e}")
+            return False
+
+    def restart_daemon_set(self, name: str, namespace: str) -> bool:
+        """滚动重启 DaemonSet"""
+        if not self._initialized:
+            return False
+        try:
+            import datetime
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            body = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kubectl.kubernetes.io/restartedAt": now
+                            }
+                        }
+                    }
+                }
+            }
+            self.apps_v1.patch_namespaced_daemon_set(name, namespace, body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error restarting DaemonSet {name}: {e}")
+            return False
+
+    def _parse_daemon_set(self, ds) -> Dict[str, Any]:
+        """解析 DaemonSet 对象"""
+        images = []
+        if ds.spec.template and ds.spec.template.spec:
+            for c in ds.spec.template.spec.containers:
+                images.append(c.image)
+        conditions = []
+        if ds.status.conditions:
+            for cond in ds.status.conditions:
+                conditions.append({
+                    "type": cond.type,
+                    "status": cond.status,
+                    "reason": cond.reason,
+                    "message": cond.message,
+                })
+        annotations = ds.metadata.annotations or {}
+        return {
+            "name": ds.metadata.name,
+            "namespace": ds.metadata.namespace,
+            "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "desired_number_scheduled": ds.status.desired_number_scheduled or 0,
+            "current_number_scheduled": ds.status.current_number_scheduled or 0,
+            "number_ready": ds.status.number_ready or 0,
+            "number_available": ds.status.number_available or 0,
+            "number_misscheduled": ds.status.number_misscheduled or 0,
+            "updated_number_scheduled": ds.status.updated_number_scheduled or 0,
+            "labels": ds.metadata.labels or {},
+            "images": images,
+            "conditions": conditions,
+            "created_at": ds.metadata.creation_timestamp.isoformat() if ds.metadata.creation_timestamp else None,
+        }
+
+    # ========== StatefulSet 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_stateful_sets(self, namespace: str = "default", label_selector: Optional[str] = None,
+                           all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 StatefulSet 列表"""
+        if not self._initialized:
+            return []
+        try:
+            kwargs = {}
+            if label_selector:
+                kwargs["label_selector"] = label_selector
+            if all_namespaces:
+                ss_list = self.apps_v1.list_stateful_set_for_all_namespaces(**kwargs)
+            else:
+                ss_list = self.apps_v1.list_namespaced_stateful_set(namespace, **kwargs)
+            return [self._parse_stateful_set(ss) for ss in ss_list.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing StatefulSets: {e}")
+            return []
+
+    def delete_stateful_set(self, name: str, namespace: str = "default") -> bool:
+        """删除 StatefulSet"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.delete_namespaced_stateful_set(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting StatefulSet {name}: {e}")
+            return False
+
+    def scale_stateful_set(self, name: str, namespace: str, replicas: int) -> bool:
+        """调整 StatefulSet 副本数"""
+        if not self._initialized:
+            return False
+        try:
+            self.apps_v1.patch_namespaced_stateful_set_scale(
+                name, namespace, {"spec": {"replicas": replicas}}
+            )
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error scaling StatefulSet {name}: {e}")
+            return False
+
+    def restart_stateful_set(self, name: str, namespace: str) -> bool:
+        """滚动重启 StatefulSet"""
+        if not self._initialized:
+            return False
+        try:
+            import datetime
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            body = {
+                "spec": {
+                    "template": {
+                        "metadata": {
+                            "annotations": {
+                                "kubectl.kubernetes.io/restartedAt": now
+                            }
+                        }
+                    }
+                }
+            }
+            self.apps_v1.patch_namespaced_stateful_set(name, namespace, body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error restarting StatefulSet {name}: {e}")
+            return False
+
+    def _parse_stateful_set(self, ss) -> Dict[str, Any]:
+        """解析 StatefulSet 对象"""
+        images = []
+        if ss.spec.template and ss.spec.template.spec:
+            for c in ss.spec.template.spec.containers:
+                images.append(c.image)
+        conditions = []
+        if ss.status.conditions:
+            for cond in ss.status.conditions:
+                conditions.append({
+                    "type": cond.type,
+                    "status": cond.status,
+                    "reason": cond.reason,
+                    "message": cond.message,
+                })
+        annotations = ss.metadata.annotations or {}
+        return {
+            "name": ss.metadata.name,
+            "namespace": ss.metadata.namespace,
+            "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "replicas": ss.spec.replicas or 0,
+            "ready_replicas": ss.status.ready_replicas or 0,
+            "current_replicas": ss.status.current_replicas or 0,
+            "updated_replicas": ss.status.updated_replicas or 0,
+            "labels": ss.metadata.labels or {},
+            "images": images,
+            "conditions": conditions,
+            "service_name": ss.spec.service_name or "",
+            "update_strategy": ss.spec.update_strategy.type if ss.spec.update_strategy else "RollingUpdate",
+            "created_at": ss.metadata.creation_timestamp.isoformat() if ss.metadata.creation_timestamp else None,
+        }
 
     @_k8s_retry(max_retries=2, delay=1.0)
     def list_storage_classes(self) -> List[Dict[str, Any]]:
