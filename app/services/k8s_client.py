@@ -431,12 +431,14 @@ class K8sClient:
             effective_status = "starting"
         else:
             effective_status = phase
+        pod_labels = pod.metadata.labels or {}
         return {
             "name": pod.metadata.name,
             "namespace": pod.metadata.namespace,
-            "labels": pod.metadata.labels or {},
+            "labels": pod_labels,
             "annotations": annotations,
             "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "instance_id": pod_labels.get("instance-id", ""),
             "status": phase,                    # 原始 K8s Phase（供过滤/筛选用）
             "effective_status": effective_status,  # 业务状态（考虑容器就绪和 Terminating）
             "is_terminating": is_terminating,
@@ -592,6 +594,203 @@ class K8sClient:
                 print(f"[K8s] Error creating namespace {name}: {e}")
                 return False
 
+    def get_namespace(self, name: str) -> Optional[Dict[str, Any]]:
+        """获取命名空间详情"""
+        if not self._initialized:
+            return None
+        try:
+            ns = self.core_v1.read_namespace(name)
+            return {
+                "name": ns.metadata.name,
+                "status": ns.status.phase if ns.status else "Active",
+                "labels": ns.metadata.labels or {},
+                "annotations": {k: v for k, v in (ns.metadata.annotations or {}).items()
+                                if not k.startswith("kubectl.kubernetes.io/")},
+                "created_at": ns.metadata.creation_timestamp.isoformat() if ns.metadata.creation_timestamp else None,
+            }
+        except ApiException as e:
+            print(f"[K8s] Error getting namespace {name}: {e}")
+            return None
+
+    def create_namespace(self, name: str, labels: Optional[Dict[str, str]] = None) -> bool:
+        """创建命名空间"""
+        if not self._initialized:
+            return False
+        try:
+            body = {"metadata": {"name": name}}
+            if labels:
+                body["metadata"]["labels"] = labels
+            self.core_v1.create_namespace(body)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error creating namespace {name}: {e}")
+            return False
+
+    def delete_namespace(self, name: str) -> bool:
+        """删除命名空间"""
+        if not self._initialized:
+            return False
+        try:
+            self.core_v1.delete_namespace(name)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting namespace {name}: {e}")
+            return False
+
+    def get_namespace_resource_quota(self, namespace: str) -> Dict[str, Any]:
+        """获取命名空间资源用量(Pod/Service/ConfigMap/Secret/PVC 计数)"""
+        if not self._initialized:
+            return {}
+        result: Dict[str, Any] = {}
+        try:
+            # ResourceQuota
+            quotas = self.core_v1.list_namespaced_resource_quota(namespace)
+            if quotas.items:
+                q = quotas.items[0]
+                result["quota"] = {
+                    "hard": q.status.hard if q.status and q.status.hard else {},
+                    "used": q.status.used if q.status and q.status.used else {},
+                }
+        except Exception:
+            pass
+        try:
+            pods = self.core_v1.list_namespaced_pod(namespace)
+            result["pods"] = len(pods.items)
+        except Exception:
+            result["pods"] = 0
+        try:
+            svcs = self.core_v1.list_namespaced_service(namespace)
+            result["services"] = len(svcs.items)
+        except Exception:
+            result["services"] = 0
+        try:
+            cms = self.core_v1.list_namespaced_config_map(namespace)
+            result["configmaps"] = len(cms.items)
+        except Exception:
+            result["configmaps"] = 0
+        try:
+            secs = self.core_v1.list_namespaced_secret(namespace)
+            result["secrets"] = len(secs.items)
+        except Exception:
+            result["secrets"] = 0
+        return result
+
+    # ========== ConfigMap 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_config_maps(self, namespace: str = "default",
+                         all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 ConfigMap 列表"""
+        if not self._initialized:
+            return []
+        try:
+            if all_namespaces:
+                cms = self.core_v1.list_config_map_for_all_namespaces()
+            else:
+                cms = self.core_v1.list_namespaced_config_map(namespace)
+            return [self._parse_config_map(cm) for cm in cms.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing ConfigMaps: {e}")
+            return []
+
+    def get_config_map(self, name: str, namespace: str = "default") -> Optional[Dict[str, Any]]:
+        """获取 ConfigMap 详情"""
+        if not self._initialized:
+            return None
+        try:
+            cm = self.core_v1.read_namespaced_config_map(name, namespace)
+            result = self._parse_config_map(cm)
+            result["data"] = cm.data or {}
+            result["binary_data_keys"] = list((cm.binary_data or {}).keys())
+            return result
+        except ApiException as e:
+            print(f"[K8s] Error getting ConfigMap {namespace}/{name}: {e}")
+            return None
+
+    def delete_config_map(self, name: str, namespace: str = "default") -> bool:
+        """删除 ConfigMap"""
+        if not self._initialized:
+            return False
+        try:
+            self.core_v1.delete_namespaced_config_map(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting ConfigMap {namespace}/{name}: {e}")
+            return False
+
+    def _parse_config_map(self, cm) -> Dict[str, Any]:
+        """解析 ConfigMap 对象"""
+        return {
+            "name": cm.metadata.name,
+            "namespace": cm.metadata.namespace,
+            "labels": cm.metadata.labels or {},
+            "key_count": len(cm.data or {}) + len(cm.binary_data or {}),
+            "keys": list((cm.data or {}).keys()),
+            "created_at": cm.metadata.creation_timestamp.isoformat() if cm.metadata.creation_timestamp else None,
+        }
+
+    # ========== Secret 管理 ==========
+
+    @_k8s_retry(max_retries=2, delay=1.0)
+    def list_secrets(self, namespace: str = "default",
+                     all_namespaces: bool = False) -> List[Dict[str, Any]]:
+        """获取 Secret 列表"""
+        if not self._initialized:
+            return []
+        try:
+            if all_namespaces:
+                secs = self.core_v1.list_secret_for_all_namespaces()
+            else:
+                secs = self.core_v1.list_namespaced_secret(namespace)
+            return [self._parse_secret(s) for s in secs.items]
+        except ApiException as e:
+            if e.status == 0:
+                raise
+            print(f"[K8s] Error listing Secrets: {e}")
+            return []
+
+    def get_secret(self, name: str, namespace: str = "default") -> Optional[Dict[str, Any]]:
+        """获取 Secret 详情（值脱敏，仅返回 key 列表和长度）"""
+        if not self._initialized:
+            return None
+        try:
+            s = self.core_v1.read_namespaced_secret(name, namespace)
+            result = self._parse_secret(s)
+            # 脱敏：仅显示 key 名和值长度
+            data_info = {}
+            for k, v in (s.data or {}).items():
+                data_info[k] = f"({len(v)} chars, base64)" if v else "(empty)"
+            result["data_info"] = data_info
+            return result
+        except ApiException as e:
+            print(f"[K8s] Error getting Secret {namespace}/{name}: {e}")
+            return None
+
+    def delete_secret(self, name: str, namespace: str = "default") -> bool:
+        """删除 Secret"""
+        if not self._initialized:
+            return False
+        try:
+            self.core_v1.delete_namespaced_secret(name, namespace)
+            return True
+        except ApiException as e:
+            print(f"[K8s] Error deleting Secret {namespace}/{name}: {e}")
+            return False
+
+    def _parse_secret(self, s) -> Dict[str, Any]:
+        """解析 Secret 对象"""
+        return {
+            "name": s.metadata.name,
+            "namespace": s.metadata.namespace,
+            "type": s.type or "Opaque",
+            "labels": s.metadata.labels or {},
+            "key_count": len(s.data or {}),
+            "keys": list((s.data or {}).keys()),
+            "created_at": s.metadata.creation_timestamp.isoformat() if s.metadata.creation_timestamp else None,
+        }
+
     # ========== Deployment 管理 ==========
 
     @_k8s_retry(max_retries=2, delay=1.0)
@@ -718,10 +917,12 @@ class K8sClient:
                     "message": cond.message,
                 })
         annotations = dep.metadata.annotations or {}
+        labels = dep.metadata.labels or {}
         return {
             "name": dep.metadata.name,
             "namespace": dep.metadata.namespace,
             "instance_name": annotations.get("lmaicloud/instance-name", ""),
+            "instance_id": labels.get("instance-id", ""),
             "annotations": annotations,
             "replicas": dep.spec.replicas or 0,
             "ready_replicas": dep.status.ready_replicas or 0,

@@ -223,11 +223,13 @@ async def create_payment(
     db: AsyncSession = Depends(get_db)
 ):
     """创建支付订单，返回支付二维码URL"""
+    if payment_data.amount <= 0:
+        raise HTTPException(status_code=400, detail="充值金额必须大于0")
     min_amount = 0.01 if settings.wechat_test_mode else 1
     if payment_data.amount < min_amount:
         raise HTTPException(status_code=400, detail=f"最低充值金额为 ¥{min_amount}")
     if payment_data.amount > 50000:
-        raise HTTPException(status_code=400, detail="Maximum recharge amount is ¥50000")
+        raise HTTPException(status_code=400, detail="单笔充值金额不能超过 ¥50000")
 
     order_id = generate_order_id()
 

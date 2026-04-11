@@ -17,6 +17,9 @@ from arq import create_pool, cron
 from arq.connections import RedisSettings, ArqRedis
 
 from app.config import settings
+from app.logging_config import get_logger
+
+logger = get_logger("lmaicloud.tasks")
 
 
 # ============== Redis 连接配置 ==============
@@ -62,7 +65,7 @@ async def send_email_task(ctx: dict, to_email: str, subject: str, content: str) 
         任务执行结果
     """
     # TODO: 实际的邮件发送逻辑
-    print(f"[EMAIL] Sending email to {to_email}: {subject}")
+    logger.info(f"[EMAIL] Sending email to {to_email}: {subject}")
     await asyncio.sleep(0.1)  # 模拟发送延迟
     
     return {
@@ -87,7 +90,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
     from datetime import datetime
     from dateutil.relativedelta import relativedelta
 
-    print(f"[BILLING] Processing billing for {instance_type} instance: {instance_id}")
+    logger.info(f"[BILLING] Processing billing for {instance_type} instance: {instance_id}")
 
     async with AsyncSessionLocal() as session:
         # 根据类型获取实例
@@ -193,11 +196,11 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
             # last_billed_at 为空：用 started_at 回溯，立即计费（不再等下一周期）
             last_billed = getattr(instance, 'started_at', None) or datetime.utcnow()
             instance.last_billed_at = last_billed
-            print(f"[BILLING] Initialized last_billed_at for {instance_type} {instance_id} to {last_billed}")
+            logger.info(f"[BILLING] Initialized last_billed_at for {instance_type} {instance_id} to {last_billed}")
 
         now = datetime.utcnow()
         duration = int((now - last_billed).total_seconds())
-        print(f"[BILLING] {instance_type} {instance_id}: hourly_price={hourly_price}, duration={duration}s, last_billed={last_billed}")
+        logger.info(f"[BILLING] {instance_type} {instance_id}: hourly_price={hourly_price}, duration={duration}s, last_billed={last_billed}")
         if duration < 60:
             await session.commit()  # 保存 last_billed_at 初始化
             return {"status": "skipped", "reason": f"duration too short ({duration}s)"}
@@ -229,7 +232,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
         billing_result = "processed"
         if user.balance <= -10:
             # 欠费超过 10 元 → 强制关机
-            print(f"[BILLING] User {user.id} debt {user.balance:.2f} >= 10, force stopping {instance_type} {instance_id}")
+            logger.warning(f"[BILLING] User {user.id} debt {user.balance:.2f} >= 10, force stopping {instance_type} {instance_id}")
             try:
                 if instance_type == "openclaw":
                     from app.services.openclaw_manager import get_openclaw_manager
@@ -245,7 +248,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
                 instance.last_billed_at = None
                 billing_result = "force_stopped"
             except Exception as e:
-                print(f"[BILLING] Force stop failed for {instance_type} {instance_id}: {e}")
+                logger.error(f"[BILLING] Force stop failed for {instance_type} {instance_id}: {e}")
 
             # 发送强制关机通知
             notification = Notification(
@@ -257,7 +260,7 @@ async def process_instance_billing_task(ctx: dict, instance_id: str, instance_ty
             session.add(notification)
         elif user.balance < 0:
             # 欠费但未超 10 元 → 发送警告通知
-            print(f"[BILLING] User {user.id} balance negative: {user.balance:.2f}, sending warning")
+            logger.warning(f"[BILLING] User {user.id} balance negative: {user.balance:.2f}, sending warning")
             notification = Notification(
                 user_id=user.id,
                 title="余额不足提醒",
@@ -289,7 +292,7 @@ async def process_all_billing_task(ctx: dict) -> dict:
     from sqlalchemy import select
 
     now = datetime.utcnow()
-    print(f"[BILLING] Processing all instance billing at {now.isoformat()}")
+    logger.info(f"[BILLING] Processing all instance billing at {now.isoformat()}")
 
     processed = 0
     errors = 0
@@ -307,15 +310,15 @@ async def process_all_billing_task(ctx: dict) -> dict:
             )
         )
         gpu_instances = result.scalars().all()
-        print(f"[BILLING] Found {len(gpu_instances)} GPU instances to bill")
+        logger.info(f"[BILLING] Found {len(gpu_instances)} GPU instances to bill")
         for instance in gpu_instances:
             try:
                 r = await process_instance_billing_task(ctx, str(instance.id), "gpu")
-                print(f"[BILLING] GPU {instance.id}: {r.get('status')} - {r.get('reason', r.get('amount', ''))}")
+                logger.info(f"[BILLING] GPU {instance.id}: {r.get('status')} - {r.get('reason', r.get('amount', ''))}")
                 if r.get("status") in ("processed", "renewed"):
                     processed += 1
             except Exception as e:
-                print(f"[BILLING] Error processing GPU {instance.id}: {e}")
+                logger.error(f"[BILLING] Error processing GPU {instance.id}: {e}")
                 errors += 1
 
         # OpenClaw 实例（支持包月/包年）
@@ -325,15 +328,15 @@ async def process_all_billing_task(ctx: dict) -> dict:
             )
         )
         oc_instances = oc_result.scalars().all()
-        print(f"[BILLING] Found {len(oc_instances)} OpenClaw instances to bill")
+        logger.info(f"[BILLING] Found {len(oc_instances)} OpenClaw instances to bill")
         for inst in oc_instances:
             try:
                 r = await process_instance_billing_task(ctx, str(inst.id), "openclaw")
-                print(f"[BILLING] OpenClaw {inst.id}: {r.get('status')} - {r.get('reason', r.get('amount', ''))}")
+                logger.info(f"[BILLING] OpenClaw {inst.id}: {r.get('status')} - {r.get('reason', r.get('amount', ''))}")
                 if r.get("status") in ("processed", "renewed"):
                     processed += 1
             except Exception as e:
-                print(f"[BILLING] Error processing OpenClaw {inst.id}: {e}")
+                logger.error(f"[BILLING] Error processing OpenClaw {inst.id}: {e}")
                 errors += 1
 
     return {
@@ -355,7 +358,7 @@ async def check_instance_health_task(ctx: dict, instance_id: str) -> dict:
     Returns:
         健康检查结果
     """
-    print(f"[HEALTH] Checking health for instance: {instance_id}")
+    logger.info(f"[HEALTH] Checking health for instance: {instance_id}")
     # TODO: 实际的健康检查逻辑
     # 1. Pod 状态检查
     # 2. GPU 状态检查
@@ -475,14 +478,14 @@ async def sync_instance_status_task(ctx: dict) -> dict:
                         bt_val = bt_val.value
                     if bt_val not in ('monthly', 'yearly'):
                         inst.last_billed_at = datetime.utcnow()
-                        print(f"[INSTANCE_SYNC] Set last_billed_at for {inst_id} (transition to running)")
+                        logger.info(f"[INSTANCE_SYNC] Set last_billed_at for {inst_id} (transition to running)")
                 elif old_status == _IS.RUNNING and inst.last_billed_at:
                     # 从 running 回退到其他状态：清除 last_billed_at，避免后续删除时误计费
                     bt_val = getattr(inst, 'billing_type', 'hourly')
                     if hasattr(bt_val, 'value'):
                         bt_val = bt_val.value
                     if bt_val not in ('monthly', 'yearly'):
-                        print(f"[INSTANCE_SYNC] Status {old_status}->{new_status}, clearing last_billed_at for {inst_id}")
+                        logger.info(f"[INSTANCE_SYNC] Status {old_status}->{new_status}, clearing last_billed_at for {inst_id}")
                         inst.last_billed_at = None
 
                 await session.commit()
@@ -517,7 +520,7 @@ async def sync_instance_status_task(ctx: dict) -> dict:
                     bt_val = bt_val.value
                 if bt_val not in ('monthly', 'yearly'):
                     fix_inst.last_billed_at = fix_inst.started_at or datetime.utcnow()
-                    print(f"[INSTANCE_SYNC] Fixed missing last_billed_at for running GPU instance {fix_inst.id}")
+                    logger.info(f"[INSTANCE_SYNC] Fixed missing last_billed_at for running GPU instance {fix_inst.id}")
             await session.commit()
 
             return {"status": "ok", "synced": synced}
@@ -533,7 +536,7 @@ async def cleanup_expired_instances_task(ctx: dict) -> dict:
     Returns:
         清理结果
     """
-    print(f"[CLEANUP] Cleaning up expired instances...")
+    logger.info("[CLEANUP] Cleaning up expired instances...")
     # TODO: 实际的清理逻辑
     # 1. 查询所有过期实例
     # 2. 释放资源
@@ -554,7 +557,7 @@ async def generate_daily_report_task(ctx: dict) -> dict:
     Returns:
         报表生成结果
     """
-    print(f"[REPORT] Generating daily report...")
+    logger.info("[REPORT] Generating daily report...")
     # TODO: 实际的报表生成逻辑
     # 1. 统计当日数据
     # 2. 生成报表
@@ -716,7 +719,7 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
 
     CREATING_TIMEOUT = timedelta(minutes=10)
     synced = 0
-    print(f"[OPENCLAW_SYNC] Task started")
+    logger.info("[OPENCLAW_SYNC] Task started")
 
     try:
         async with AsyncSessionLocal() as session:
@@ -728,14 +731,14 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
             instances = result.scalars().all()
             if not instances:
                 return {"status": "ok", "synced": 0}
-            print(f"[OPENCLAW_SYNC] Found {len(instances)} instances to check")
+            logger.info(f"[OPENCLAW_SYNC] Found {len(instances)} instances to check")
 
             k8s = get_k8s_client()
             if not k8s.is_connected:
-                print("[OPENCLAW_SYNC] K8s client not connected, skipping")
+                logger.warning("[OPENCLAW_SYNC] K8s client not connected, skipping")
                 return {"status": "skipped", "reason": "k8s not connected"}
             if k8s.circuit_open:
-                print("[OPENCLAW_SYNC] K8s circuit breaker open, skipping")
+                logger.warning("[OPENCLAW_SYNC] K8s circuit breaker open, skipping")
                 return {"status": "skipped", "reason": "k8s circuit breaker open"}
 
             now_utc = datetime.now(timezone.utc)
@@ -745,7 +748,7 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                     dep_name = inst.deployment_name
                     ns = inst.namespace
                     if not dep_name or not ns:
-                        print(f"[OPENCLAW_SYNC] Skipping {inst.id}: dep_name={dep_name}, ns={ns}")
+                        logger.warning(f"[OPENCLAW_SYNC] Skipping {inst.id}: dep_name={dep_name}, ns={ns}")
                         continue
 
                     dep_info = k8s.get_deployment(dep_name, ns)
@@ -757,13 +760,13 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                             if created and created.tzinfo is None:
                                 created = created.replace(tzinfo=timezone.utc)
                             if created and (now_utc - created) > CREATING_TIMEOUT:
-                                print(f"[OPENCLAW_SYNC] {inst.id} creating timeout, marking error")
+                                logger.warning(f"[OPENCLAW_SYNC] {inst.id} creating timeout, marking error")
                                 inst.status = "error"
                                 synced += 1
                             # else: 未超时，继续等待
                         elif inst.status in ("running", "stopped"):
                             # 原本在运行/已停止 但 Deployment 已消失
-                            print(f"[OPENCLAW_SYNC] Deployment {dep_name} not found, {inst.id} -> error")
+                            logger.warning(f"[OPENCLAW_SYNC] Deployment {dep_name} not found, {inst.id} -> error")
                             inst.status = "error"
                             synced += 1
                         # error 状态且无 Deployment → 保持
@@ -772,7 +775,7 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                     replicas = dep_info.get("ready_replicas", 0) or 0
                     desired = dep_info.get("replicas", 1) or 1
                     conditions = dep_info.get("conditions") or []
-                    print(f"[OPENCLAW_SYNC] {inst.id} dep={dep_name}: ready={replicas}/{desired}, current_status={inst.status}")
+                    logger.info(f"[OPENCLAW_SYNC] {inst.id} dep={dep_name}: ready={replicas}/{desired}, current_status={inst.status}")
 
                     # 检查 Deployment 明确失败条件
                     dep_failed = False
@@ -807,16 +810,16 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                             bt_val = bt.value if bt and hasattr(bt, 'value') else (bt or 'hourly')
                             if bt_val not in ('monthly', 'yearly'):
                                 inst.last_billed_at = datetime.utcnow()
-                                print(f"[OPENCLAW_SYNC] Set last_billed_at for {inst.id} (transition to running)")
+                                logger.info(f"[OPENCLAW_SYNC] Set last_billed_at for {inst.id} (transition to running)")
                         elif old_status == "running" and inst.last_billed_at:
                             # 从 running 回退到其他状态：清除 last_billed_at，避免后续删除时误计费
                             bt = getattr(inst, 'billing_type', None)
                             bt_val = bt.value if bt and hasattr(bt, 'value') else (bt or 'hourly')
                             if bt_val not in ('monthly', 'yearly'):
-                                print(f"[OPENCLAW_SYNC] Status {old_status}->{new_status}, clearing last_billed_at for {inst.id}")
+                                logger.info(f"[OPENCLAW_SYNC] Status {old_status}->{new_status}, clearing last_billed_at for {inst.id}")
                                 inst.last_billed_at = None
                         synced += 1
-                        print(f"[OPENCLAW_SYNC] Status changed {old_status}->{new_status} for {inst.id}")
+                        logger.info(f"[OPENCLAW_SYNC] Status changed {old_status}->{new_status} for {inst.id}")
 
                     # 补救：running 状态但 last_billed_at 为 None 的按量计费实例
                     if inst.status == "running" and not inst.last_billed_at:
@@ -824,10 +827,10 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                         bt_val = bt.value if bt and hasattr(bt, 'value') else (bt or 'hourly')
                         if bt_val not in ('monthly', 'yearly'):
                             inst.last_billed_at = inst.started_at or datetime.utcnow()
-                            print(f"[OPENCLAW_SYNC] Fixed missing last_billed_at for running instance {inst.id}")
+                            logger.info(f"[OPENCLAW_SYNC] Fixed missing last_billed_at for running instance {inst.id}")
 
                 except Exception as e:
-                    print(f"[OPENCLAW_SYNC] Error syncing {inst.id}: {e}")
+                    logger.error(f"[OPENCLAW_SYNC] Error syncing {inst.id}: {e}")
 
             await session.commit()
 
@@ -1017,11 +1020,11 @@ async def openclaw_skill_manage(ctx: dict, instance_id: str, skill_name: str, ac
 
 async def startup(ctx: dict):
     """Worker 启动时执行"""
-    print(f"[ARQ] Worker starting up at {datetime.utcnow().isoformat()}")
+    logger.info(f"[ARQ] Worker starting up at {datetime.utcnow().isoformat()}")
     # 打印所有已注册的 cron 任务
     for c in WorkerSettings.cron_jobs:
-        print(f"[ARQ]   cron: {c.name}, second={c.second}, minute={c.minute}, unique={c.unique}")
-    print(f"[ARQ] Total cron jobs: {len(WorkerSettings.cron_jobs)}")
+        logger.info(f"[ARQ]   cron: {c.name}, second={c.second}, minute={c.minute}, unique={c.unique}")
+    logger.info(f"[ARQ] Total cron jobs: {len(WorkerSettings.cron_jobs)}")
 
     # 启动时清理残留的 in-progress 键（上次 Worker 异常退出可能遗留）
     redis = ctx.get('redis')
@@ -1037,18 +1040,18 @@ async def startup(ctx: dict):
             if stale_keys:
                 deleted = await redis.delete(*stale_keys)
                 key_names = [k.decode() if isinstance(k, bytes) else str(k) for k in stale_keys]
-                print(f"[ARQ] Cleaned {deleted} stale in-progress keys: {key_names}")
+                logger.info(f"[ARQ] Cleaned {deleted} stale in-progress keys: {key_names}")
             else:
-                print("[ARQ] No stale in-progress keys found")
+                logger.info("[ARQ] No stale in-progress keys found")
         except Exception as e:
-            print(f"[ARQ] Error cleaning stale keys: {e}")
+            logger.error(f"[ARQ] Error cleaning stale keys: {e}")
     else:
-        print("[ARQ] WARNING: redis not available in ctx, skip in-progress cleanup")
+        logger.warning("[ARQ] WARNING: redis not available in ctx, skip in-progress cleanup")
 
 
 async def shutdown(ctx: dict):
     """Worker 关闭时执行"""
-    print(f"[ARQ] Worker shutting down at {datetime.utcnow().isoformat()}")
+    logger.info(f"[ARQ] Worker shutting down at {datetime.utcnow().isoformat()}")
     # 可以在这里清理资源
 
 

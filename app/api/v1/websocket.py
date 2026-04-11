@@ -317,7 +317,7 @@ async def websocket_terminal(
                         try:
                             await websocket.send_json({"type": "info", "data": "终端会话已结束"})
                             await websocket.close(code=1000, reason="Shell exited")
-                        except: pass
+                        except Exception: pass
                         break
                     if output:
                         await websocket.send_json({
@@ -459,7 +459,7 @@ async def websocket_openclaw_terminal(
                         try:
                             await websocket.send_json({"type": "info", "data": "终端会话已结束"})
                             await websocket.close(code=1000, reason="Shell exited")
-                        except: pass
+                        except Exception: pass
                         break
                     if output:
                         await websocket.send_json({
@@ -589,7 +589,7 @@ async def websocket_openclaw_admin_terminal(
                         try:
                             await websocket.send_json({"type": "info", "data": "终端会话已结束"})
                             await websocket.close(code=1000, reason="Shell exited")
-                        except: pass
+                        except Exception: pass
                         break
                     if output:
                         await websocket.send_json({

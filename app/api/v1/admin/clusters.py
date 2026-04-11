@@ -1,7 +1,8 @@
 """集群管理 API - 直接从K8s获取运行态数据"""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import List
+from typing import List, Optional
+from pydantic import BaseModel, Field
 
 from app.database import get_db
 from app.config import settings
@@ -60,19 +61,83 @@ async def get_cluster_stats(
     }
 
 
+# ===== 受保护的系统命名空间 =====
+_PROTECTED_NAMESPACES = {"default", "kube-system", "kube-public", "kube-node-lease"}
+
+
+class NamespaceCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=63, pattern=r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$')
+    labels: Optional[dict] = None
+
+
 @router.get("/namespaces/list", summary="获取命名空间列表")
 async def list_namespaces(
+    search: Optional[str] = Query(None),
     current_user=Depends(get_current_admin_user),
 ):
     """获取 K8s 命名空间列表"""
     k8s = get_k8s_client()
     if not k8s.is_connected:
-        return {"list": []}
+        return {"list": [], "total": 0}
     try:
-        return {"list": k8s.list_namespaces()}
+        ns_list = k8s.list_namespaces()
+        if search:
+            ns_list = [ns for ns in ns_list if search.lower() in ns["name"].lower()]
+        return {"list": ns_list, "total": len(ns_list)}
     except Exception as e:
-        print(f"[API] list_namespaces error: {e}")
-        return {"list": []}
+        logger.error(f"获取命名空间列表失败: {e}")
+        return {"list": [], "total": 0}
+
+
+@router.post("/namespaces", summary="创建命名空间")
+async def create_namespace(
+    body: NamespaceCreate,
+    current_user=Depends(get_current_admin_user),
+):
+    """创建 K8s 命名空间"""
+    k8s = get_k8s_client()
+    if not k8s.is_connected:
+        raise HTTPException(status_code=503, detail="K8s 集群未连接")
+    ok = k8s.create_namespace(body.name, labels=body.labels)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"创建命名空间 {body.name} 失败，可能已存在")
+    logger.info(f"创建命名空间 {body.name}")
+    return {"message": "创建成功", "name": body.name}
+
+
+@router.get("/namespaces/{name}", summary="获取命名空间详情")
+async def get_namespace(
+    name: str,
+    current_user=Depends(get_current_admin_user),
+):
+    """获取命名空间详情及资源用量"""
+    k8s = get_k8s_client()
+    if not k8s.is_connected:
+        raise HTTPException(status_code=503, detail="K8s 集群未连接")
+    ns = k8s.get_namespace(name)
+    if not ns:
+        raise HTTPException(status_code=404, detail=f"命名空间 {name} 不存在")
+    ns["resources"] = k8s.get_namespace_resource_quota(name)
+    ns["protected"] = name in _PROTECTED_NAMESPACES
+    return ns
+
+
+@router.delete("/namespaces/{name}", summary="删除命名空间")
+async def delete_namespace(
+    name: str,
+    current_user=Depends(get_current_admin_user),
+):
+    """删除 K8s 命名空间（保护系统命名空间）"""
+    if name in _PROTECTED_NAMESPACES:
+        raise HTTPException(status_code=403, detail=f"系统命名空间 {name} 不可删除")
+    k8s = get_k8s_client()
+    if not k8s.is_connected:
+        raise HTTPException(status_code=503, detail="K8s 集群未连接")
+    ok = k8s.delete_namespace(name)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"删除命名空间 {name} 失败")
+    logger.info(f"删除命名空间 {name}")
+    return {"message": "删除成功"}
 
 
 @router.get("/health", summary="集群健康检查")

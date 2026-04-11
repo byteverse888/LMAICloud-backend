@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     # JWT
     jwt_secret_key: str = "your-super-secret-key-change-in-production"
     jwt_algorithm: str = "HS256"
-    jwt_access_token_expire_minutes: int = 15
-    jwt_refresh_token_expire_minutes: int = 10
+    jwt_access_token_expire_minutes: int = 5    # 5分钟
+    jwt_refresh_token_expire_minutes: int = 10   # 10分钟（无操作超时）
     
     # Redis
     redis_url: str = "redis://localhost:6379"

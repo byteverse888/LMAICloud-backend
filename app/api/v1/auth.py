@@ -79,26 +79,95 @@ async def _get_and_delete_captcha(captcha_id: str) -> Optional[str]:
             return stored['answer']
         return None
 
+
+async def _set_verify_code(email: str, code: str, ttl: int = 600):
+    """存储邮箱验证码（优先Redis，降级内存）"""
+    r = await _get_redis()
+    if r:
+        import json as _json
+        data = _json.dumps({"code": code, "sent_at": datetime.now().isoformat()})
+        await r.setex(f"verify_code:{email}", ttl, data)
+    else:
+        verify_codes[email] = {
+            'code': code,
+            'sent_at': datetime.now(),
+            'expires_at': datetime.now() + timedelta(seconds=ttl),
+        }
+
+
+async def _get_verify_code(email: str) -> Optional[dict]:
+    """获取邮箱验证码（不删除，用于频率检查）"""
+    r = await _get_redis()
+    if r:
+        import json as _json
+        data = await r.get(f"verify_code:{email}")
+        if data:
+            parsed = _json.loads(data)
+            return {"code": parsed["code"], "sent_at": datetime.fromisoformat(parsed["sent_at"])}
+        return None
+    else:
+        stored = verify_codes.get(email)
+        if stored and datetime.now() < stored['expires_at']:
+            return stored
+        return None
+
+
+async def _pop_verify_code(email: str) -> Optional[str]:
+    """获取并删除邮箱验证码，返回 code 字符串"""
+    r = await _get_redis()
+    if r:
+        import json as _json
+        data = await r.getdel(f"verify_code:{email}")
+        if data:
+            return _json.loads(data)["code"]
+        return None
+    else:
+        stored = verify_codes.pop(email, None)
+        if stored and datetime.now() < stored['expires_at']:
+            return stored['code']
+        return None
+
 # ── 登录速率限制 ──────────────────────────────────────────────
-# {ip_or_email: [timestamp, ...]}  —— 滑动窗口
-_login_attempts: dict[str, list[float]] = defaultdict(list)
+_login_attempts: dict[str, list[float]] = defaultdict(list)  # 内存降级用
 LOGIN_RATE_WINDOW = 900     # 15分钟窗口
 LOGIN_MAX_ATTEMPTS_IP = 30  # 同一IP 15分钟内最多30次
 LOGIN_MAX_ATTEMPTS_EMAIL = 10  # 同一邮箱 15分钟内最多10次
 
 
-def _check_login_rate(key: str, max_attempts: int):
-    """检查滑动窗口速率限制"""
-    now = datetime.now().timestamp()
-    attempts = _login_attempts[key]
-    # 清除窗口外的记录
-    _login_attempts[key] = [t for t in attempts if now - t < LOGIN_RATE_WINDOW]
-    if len(_login_attempts[key]) >= max_attempts:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="登录尝试次数过多，请15分钟后再试"
-        )
-    _login_attempts[key].append(now)
+async def _check_login_rate(key: str, max_attempts: int):
+    """检查滑动窗口速率限制（优先Redis，降级内存）"""
+    r = await _get_redis()
+    if r:
+        redis_key = f"login_rate:{key}"
+        now = datetime.now().timestamp()
+        pipe = r.pipeline()
+        # 移除窗口外的记录
+        pipe.zremrangebyscore(redis_key, 0, now - LOGIN_RATE_WINDOW)
+        # 统计窗口内的记录数
+        pipe.zcard(redis_key)
+        results = await pipe.execute()
+        count = results[1]
+        if count >= max_attempts:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="登录尝试次数过多，请15分钟后再试"
+            )
+        # 添加本次记录
+        pipe2 = r.pipeline()
+        pipe2.zadd(redis_key, {str(now): now})
+        pipe2.expire(redis_key, LOGIN_RATE_WINDOW)
+        await pipe2.execute()
+    else:
+        # 内存降级
+        now = datetime.now().timestamp()
+        attempts = _login_attempts[key]
+        _login_attempts[key] = [t for t in attempts if now - t < LOGIN_RATE_WINDOW]
+        if len(_login_attempts[key]) >= max_attempts:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="登录尝试次数过多，请15分钟后再试"
+            )
+        _login_attempts[key].append(now)
 
 
 # ── 密码强度验证 ─────────────────────────────────────────────
@@ -206,8 +275,9 @@ async def send_verify_code(
     logger.info(f"请求发送验证码: {email}")
     
     # 检查是否频繁发送
-    if email in verify_codes:
-        last_sent = verify_codes[email].get('sent_at')
+    existing = await _get_verify_code(email)
+    if existing:
+        last_sent = existing.get('sent_at')
         if last_sent and datetime.now() - last_sent < timedelta(seconds=60):
             logger.warning(f"验证码请求过于频繁: {email}")
             raise HTTPException(
@@ -217,11 +287,7 @@ async def send_verify_code(
     
     # 生成验证码
     code = generate_code()
-    verify_codes[email] = {
-        'code': code,
-        'sent_at': datetime.now(),
-        'expires_at': datetime.now() + timedelta(minutes=10)
-    }
+    await _set_verify_code(email, code, ttl=600)
     
     # 后台发送邮件
     background_tasks.add_task(send_email, email, code)
@@ -238,29 +304,19 @@ async def login_with_code(
     email = request.email
     code = request.code
     
-    # 验证验证码
-    stored = verify_codes.get(email)
-    if not stored:
+    # 验证验证码（从 Redis / 内存获取并删除）
+    stored_code = await _pop_verify_code(email)
+    if not stored_code:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="验证码不存在或已过期"
         )
     
-    if datetime.now() > stored['expires_at']:
-        del verify_codes[email]
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="验证码已过期"
-        )
-    
-    if stored['code'] != code:
+    if stored_code != code:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="验证码错误"
         )
-    
-    # 验证成功，删除验证码
-    del verify_codes[email]
     
     # 查找或创建用户
     result = await db.execute(select(User).where(User.email == email))
@@ -561,8 +617,8 @@ async def login(user_data: UserLogin, request: Request, db: AsyncSession = Depen
     # 速率限制（IP + 邮箱）
     from app.api.v1.audit_log import get_client_ip
     client_ip = get_client_ip(request)
-    _check_login_rate(f"ip:{client_ip}", LOGIN_MAX_ATTEMPTS_IP)
-    _check_login_rate(f"email:{user_data.email}", LOGIN_MAX_ATTEMPTS_EMAIL)
+    await _check_login_rate(f"ip:{client_ip}", LOGIN_MAX_ATTEMPTS_IP)
+    await _check_login_rate(f"email:{user_data.email}", LOGIN_MAX_ATTEMPTS_EMAIL)
     
     # 检查验证码（使用 Redis 优先 + 内存降级）
     captcha_enabled = await get_setting_value(db, "captcha_enabled", True)
