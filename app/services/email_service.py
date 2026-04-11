@@ -25,7 +25,7 @@ class EmailConfig:
         smtp_user: str = "",
         smtp_password: str = "",
         from_email: str = "",
-        from_name: str = "LMAICloud",
+        from_name: str = "龙虾云",
         use_tls: bool = True,
     ):
         self.smtp_host = smtp_host
@@ -192,7 +192,7 @@ def send_email_sync(
 def generate_activation_email_html(
     user_email: str,
     activation_link: str,
-    site_name: str = "LMAICloud",
+    site_name: str = "龙虾云",
     expire_hours: int = 24
 ) -> tuple[str, str]:
     """
@@ -283,7 +283,7 @@ async def send_activation_email(
     db: AsyncSession,
     to_email: str,
     activation_token: str,
-    site_name: str = "LMAICloud",
+    site_name: str = "龙虾云",
     expire_hours: int = 24
 ) -> bool:
     """发送激活邮件"""
@@ -313,7 +313,7 @@ async def send_activation_email(
 
 def generate_password_reset_email_html(
     activation_link: str,
-    site_name: str = "LMAICloud",
+    site_name: str = "龙虾云",
     expire_minutes: int = 30
 ) -> tuple[str, str]:
     """生成密码重置邮件的HTML和纯文本内容"""
@@ -379,7 +379,7 @@ async def send_password_reset_email(
     db: AsyncSession,
     to_email: str,
     reset_token: str,
-    site_name: str = "LMAICloud",
+    site_name: str = "龙虾云",
     expire_minutes: int = 30
 ) -> bool:
     """发送密码重置邮件"""
@@ -405,14 +405,14 @@ async def send_test_email(db: AsyncSession, to_email: str) -> tuple[bool, Option
     <div style="font-family: Arial, sans-serif; padding: 20px;">
         <h2>邮件服务测试</h2>
         <p>如果您收到这封邮件，说明邮件服务配置正确！</p>
-        <p style="color: #666;">— LMAICloud 系统</p>
+        <p style="color: #666;">— 龙虾云 系统</p>
     </div>
     """
     
     return send_email_sync(
         config=config,
         to_email=to_email,
-        subject="【LMAICloud】邮件服务测试",
+        subject="【龙虾云】邮件服务测试",
         html_content=html_content,
         text_content="邮件服务测试\n\n如果您收到这封邮件，说明邮件服务配置正确！"
     )

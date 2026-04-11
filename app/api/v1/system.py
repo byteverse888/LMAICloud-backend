@@ -10,7 +10,7 @@ from app.models import SystemSetting
 router = APIRouter()
 
 # 默认值
-DEFAULT_SITE_NAME = "LMAICloud"
+DEFAULT_SITE_NAME = "龙虾云"
 DEFAULT_SITE_DESCRIPTION = "大模型AI算力云平台"
 
 SITE_INFO_KEYS = [
@@ -38,7 +38,7 @@ async def get_site_info(db: AsyncSession = Depends(get_db)):
         "icp_number": db_settings.get("icp_number", ""),
         "icp_link": db_settings.get("icp_link", "https://beian.miit.gov.cn/"),
         "police_number": db_settings.get("police_number", ""),
-        "copyright_text": db_settings.get("copyright_text", "© 2025 LMAICloud. All rights reserved."),
+        "copyright_text": db_settings.get("copyright_text", "© 2026 龙虾云. All rights reserved."),
         "captcha_enabled": db_settings.get("captcha_enabled", True),
         "announcement_text": db_settings.get("announcement_text", ""),
     }

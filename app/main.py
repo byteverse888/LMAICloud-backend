@@ -365,7 +365,7 @@ app.include_router(ws.router, tags=["WebSocket"])
 
 @app.get("/")
 async def root():
-    return {"message": "Welcome to LMAICloud API", "version": "1.0.0"}
+    return {"message": "Welcome to 龙虾云 API", "version": "1.0.0"}
 
 
 @app.get("/health")

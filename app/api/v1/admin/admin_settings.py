@@ -96,7 +96,7 @@ _DEFAULT_RECHARGE_AGREEMENT = (
 
 # 默认设置值
 DEFAULT_SETTINGS: Dict[str, Any] = {
-    "site_name": "LMAICloud",
+    "site_name": "龙虾云",
     "site_description": "大模型AI算力云平台",
     "contact_email": "support@lmaicloud.com",
     "default_balance": 0.0,
@@ -117,7 +117,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "smtp_user": "",
     "smtp_password": "",
     "smtp_from_email": "",
-    "smtp_from_name": "LMAICloud",
+    "smtp_from_name": "龙虾云",
     "smtp_use_tls": True,
     # 品牌配置
     "site_logo": "",
@@ -125,7 +125,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "icp_number": "",
     "icp_link": "https://beian.miit.gov.cn/",
     "police_number": "",
-    "copyright_text": "© 2025 LMAICloud. All rights reserved.",
+    "copyright_text": "© 2026 龙虾云. All rights reserved.",
     # 协议
     "user_agreement": _DEFAULT_USER_AGREEMENT,
     "privacy_policy": _DEFAULT_PRIVACY_POLICY,
@@ -304,7 +304,7 @@ async def get_email_config_api(
         "smtp_user": settings.get("smtp_user", ""),
         "smtp_password": "******" if settings.get("smtp_password") else "",  # 密码不返回明文
         "smtp_from_email": settings.get("smtp_from_email", ""),
-        "smtp_from_name": settings.get("smtp_from_name", "LMAICloud"),
+        "smtp_from_name": settings.get("smtp_from_name", "龙虾云"),
         "smtp_use_tls": settings.get("smtp_use_tls", True),
         "notification_enabled": settings.get("notification_email_enabled", True),
         "verification_required": settings.get("email_verification_required", True),
@@ -335,7 +335,7 @@ async def update_email_config_api(
             "smtp_port": settings.get("smtp_port", 587),
             "smtp_user": settings.get("smtp_user", ""),
             "smtp_from_email": settings.get("smtp_from_email", ""),
-            "smtp_from_name": settings.get("smtp_from_name", "LMAICloud"),
+            "smtp_from_name": settings.get("smtp_from_name", "龙虾云"),
             "smtp_use_tls": settings.get("smtp_use_tls", True),
             "notification_enabled": settings.get("notification_email_enabled", True),
             "verification_required": settings.get("email_verification_required", True),

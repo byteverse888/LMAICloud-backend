@@ -313,7 +313,7 @@ async def register(
             await db.commit()
             
             # 获取站点名称
-            site_name = await get_setting_value(db, "site_name", "LMAICloud")
+            site_name = await get_setting_value(db, "site_name", "龙虾云")
             
             # 后台发送激活邮件
             background_tasks.add_task(
@@ -394,7 +394,7 @@ async def register(
     # 如果需要邮箱验证，发送激活邮件
     if email_verification_required:
         # 获取站点名称
-        site_name = await get_setting_value(db, "site_name", "LMAICloud")
+        site_name = await get_setting_value(db, "site_name", "龙虾云")
         
         # 后台发送激活邮件
         background_tasks.add_task(
@@ -502,7 +502,7 @@ async def resend_activation_email(
     await db.commit()
     
     # 获取站点名称
-    site_name = await get_setting_value(db, "site_name", "LMAICloud")
+    site_name = await get_setting_value(db, "site_name", "龙虾云")
     
     # 后台发送激活邮件
     background_tasks.add_task(
@@ -709,7 +709,7 @@ async def forgot_password(
         user.activation_expires_at = datetime.utcnow() + timedelta(minutes=30)
         await db.commit()
 
-        site_name = await get_setting_value(db, "site_name", "LMAICloud")
+        site_name = await get_setting_value(db, "site_name", "龙虾云")
         background_tasks.add_task(
             send_password_reset_email, db, request.email, reset_token, site_name, 30
         )
