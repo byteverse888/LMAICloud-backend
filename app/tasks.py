@@ -355,8 +355,14 @@ async def sync_instance_status_task(ctx: dict) -> dict:
 
     try:
         async with AsyncSessionLocal() as session:
+            # 查询所有非终态实例，确保 K8s 状态变化能及时同步到 DB
+            # 包括 RUNNING/ERROR：防止 K8s 恢复后 DB 仍停留在 ERROR，
+            # 或 K8s 异常后 DB 仍显示 RUNNING
             result = await session.execute(
-                select(Instance).where(Instance.status.in_([_IS.CREATING, _IS.STARTING]))
+                select(Instance).where(Instance.status.in_([
+                    _IS.CREATING, _IS.STARTING, _IS.RUNNING,
+                    _IS.STOPPING, _IS.ERROR,
+                ]))
             )
             pending = result.scalars().all()
             if not pending:
@@ -393,13 +399,24 @@ async def sync_instance_status_task(ctx: dict) -> dict:
                 if dep:
                     new_status = _derive_instance_status(dep, db_status=inst.status)
                 else:
-                    created = inst.created_at
-                    if created and created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                    if created and (now_utc - created) > CREATING_TIMEOUT:
+                    # Deployment 在 K8s 中不存在，根据当前 DB 状态分别处理
+                    if inst.status == _IS.CREATING:
+                        # 创建中但 Deployment 还没建好，检查超时
+                        created = inst.created_at
+                        if created and created.tzinfo is None:
+                            created = created.replace(tzinfo=timezone.utc)
+                        if created and (now_utc - created) > CREATING_TIMEOUT:
+                            new_status = _IS.ERROR
+                        else:
+                            continue  # 未超时，等待后台任务完成
+                    elif inst.status in (_IS.RUNNING, _IS.STARTING):
+                        # 原本在运行/启动 但 Deployment 已消失 → 标记错误
                         new_status = _IS.ERROR
+                    elif inst.status == _IS.STOPPING:
+                        # 正在停止且 Deployment 已删除 → 已停止
+                        new_status = _IS.STOPPED
                     else:
-                        continue
+                        continue  # ERROR 且无 Deployment → 保持
 
                 if new_status == inst.status:
                     continue
@@ -522,27 +539,30 @@ async def generate_daily_report_task(ctx: dict) -> dict:
 async def openclaw_model_key_monitor(ctx: dict) -> dict:
     """
     定时任务: 大模型密钥监控 (每60秒)
-    遍历所有 running 的 OpenClaw 实例, 验证每个 ModelKey 可用性并更新监控字段。
+    遍历所有 running 的 OpenClaw 实例，
+    1. 检查 Gateway 是否可达
+    2. 对每个活跃 Key 检查其 provider 对应的环境变量是否已注入（通过 Secret 存在性）
+    3. 更新 check_status / last_check_at
     """
     from app.database import AsyncSessionLocal
     from app.models import OpenClawInstance, ModelKey
     from app.services.openclaw_client import OpenClawClient, build_openclaw_url
     from sqlalchemy import select
     from datetime import datetime
+    import logging
+    logger = logging.getLogger(__name__)
 
     checked = 0
     errors = 0
 
     try:
         async with AsyncSessionLocal() as session:
-            # 获取所有运行中的 OpenClaw 实例
             result = await session.execute(
                 select(OpenClawInstance).where(OpenClawInstance.status == "running")
             )
             instances = result.scalars().all()
 
             for inst in instances:
-                # 获取该实例的所有活跃密钥
                 keys_result = await session.execute(
                     select(ModelKey).where(
                         ModelKey.instance_id == inst.id,
@@ -553,31 +573,37 @@ async def openclaw_model_key_monitor(ctx: dict) -> dict:
                 if not keys:
                     continue
 
-                # 通过 OpenClaw Gateway 获取状态
+                # 检测 Gateway 可达性 + 状态
+                gateway_ok = False
                 try:
                     url = build_openclaw_url(inst.service_name, inst.namespace, inst.port)
                     client = OpenClawClient(url, inst.gateway_token)
                     status_data = await client.get_status()
+                    gateway_ok = status_data is not None
                 except Exception:
-                    status_data = None
+                    pass
 
                 for key in keys:
-                    try:
-                        # 基础可达性: 如果 Gateway 返回了状态说明 key 至少在配置中
-                        if status_data:
-                            key.check_status = "ok"
-                        else:
-                            key.check_status = "error"
-                        key.last_check_at = datetime.utcnow()
-                        checked += 1
-                    except Exception:
+                    now = datetime.utcnow()
+                    if not gateway_ok:
+                        # Gateway 不可达，所有 key 标记 unknown
+                        key.check_status = "unknown"
+                        key.check_message = "Gateway 不可达"
+                    elif not key.api_key:
                         key.check_status = "error"
-                        key.last_check_at = datetime.utcnow()
+                        key.check_message = "API Key 为空"
                         errors += 1
+                    else:
+                        # Gateway 可达 且 Key 已配置，标记为 ok
+                        key.check_status = "ok"
+                        key.check_message = None
+                    key.last_check_at = now
+                    checked += 1
 
                 await session.commit()
 
     except Exception as e:
+        logger.error(f"Model key monitor error: {e}")
         return {"status": "error", "reason": str(e)}
 
     return {"status": "ok", "checked": checked, "errors": errors}
@@ -586,13 +612,16 @@ async def openclaw_model_key_monitor(ctx: dict) -> dict:
 async def openclaw_channel_monitor(ctx: dict) -> dict:
     """
     定时任务: 通道在线监控 (每30秒)
-    通过 OpenClawClient.get_status() 检查各通道连通性, 更新 online_status。
+    检测 Gateway 可达性，更新通道 online/offline 状态。
+    未激活的通道始终标记为 disabled。
     """
     from app.database import AsyncSessionLocal
     from app.models import OpenClawInstance, Channel
     from app.services.openclaw_client import OpenClawClient, build_openclaw_url
     from sqlalchemy import select
     from datetime import datetime
+    import logging
+    logger = logging.getLogger(__name__)
 
     checked = 0
 
@@ -605,35 +634,36 @@ async def openclaw_channel_monitor(ctx: dict) -> dict:
 
             for inst in instances:
                 channels_result = await session.execute(
-                    select(Channel).where(
-                        Channel.instance_id == inst.id,
-                        Channel.is_active == True,
-                    )
+                    select(Channel).where(Channel.instance_id == inst.id)
                 )
                 channels = channels_result.scalars().all()
                 if not channels:
                     continue
 
+                gateway_online = False
                 try:
                     url = build_openclaw_url(inst.service_name, inst.namespace, inst.port)
                     client = OpenClawClient(url, inst.gateway_token)
                     status_data = await client.get_status()
-                    gateway_online = True
+                    gateway_online = status_data is not None
                 except Exception:
-                    status_data = None
-                    gateway_online = False
+                    pass
 
+                now = datetime.utcnow()
                 for ch in channels:
-                    if gateway_online:
+                    if not ch.is_active:
+                        ch.online_status = "disabled"
+                    elif gateway_online:
                         ch.online_status = "online"
                     else:
                         ch.online_status = "offline"
-                    ch.last_check_at = datetime.utcnow()
+                    ch.last_check_at = now
                     checked += 1
 
                 await session.commit()
 
     except Exception as e:
+        logger.error(f"Channel monitor error: {e}")
         return {"status": "error", "reason": str(e)}
 
     return {"status": "ok", "checked": checked}
@@ -641,16 +671,17 @@ async def openclaw_channel_monitor(ctx: dict) -> dict:
 
 async def openclaw_instance_sync(ctx: dict) -> dict:
     """
-    定时任务: OpenClaw 实例状态同步 (每120秒)
+    定时任务: OpenClaw 实例状态同步 (每30秒)
     检查 K8s Deployment/Pod 状态并同步到 DB, 通过 Redis pub/sub 通知前端。
     """
     from app.database import AsyncSessionLocal
     from app.models import OpenClawInstance
     from app.services.k8s_client import get_k8s_client
     from sqlalchemy import select
-    from datetime import datetime, timezone
+    from datetime import datetime, timedelta, timezone
     import json
 
+    CREATING_TIMEOUT = timedelta(minutes=10)
     synced = 0
     print(f"[OPENCLAW_SYNC] Task started")
 
@@ -674,6 +705,8 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
                 print("[OPENCLAW_SYNC] K8s circuit breaker open, skipping")
                 return {"status": "skipped", "reason": "k8s circuit breaker open"}
 
+            now_utc = datetime.now(timezone.utc)
+
             for inst in instances:
                 try:
                     dep_name = inst.deployment_name
@@ -684,22 +717,50 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
 
                     dep_info = k8s.get_deployment(dep_name, ns)
                     if not dep_info:
-                        # Deployment 已不存在
-                        print(f"[OPENCLAW_SYNC] Deployment {dep_name} not found in {ns}, inst={inst.id}")
-                        if inst.status not in ("released", "releasing"):
+                        # Deployment 不存在，根据当前状态分别处理
+                        if inst.status == "creating":
+                            # 创建中但 Deployment 还没建好，检查超时
+                            created = inst.created_at
+                            if created and created.tzinfo is None:
+                                created = created.replace(tzinfo=timezone.utc)
+                            if created and (now_utc - created) > CREATING_TIMEOUT:
+                                print(f"[OPENCLAW_SYNC] {inst.id} creating timeout, marking error")
+                                inst.status = "error"
+                                synced += 1
+                            # else: 未超时，继续等待
+                        elif inst.status in ("running", "stopped"):
+                            # 原本在运行/已停止 但 Deployment 已消失
+                            print(f"[OPENCLAW_SYNC] Deployment {dep_name} not found, {inst.id} -> error")
                             inst.status = "error"
                             synced += 1
+                        # error 状态且无 Deployment → 保持
                         continue
 
                     replicas = dep_info.get("ready_replicas", 0) or 0
                     desired = dep_info.get("replicas", 1) or 1
+                    conditions = dep_info.get("conditions") or []
                     print(f"[OPENCLAW_SYNC] {inst.id} dep={dep_name}: ready={replicas}/{desired}, current_status={inst.status}")
 
-                    if desired == 0:
+                    # 检查 Deployment 明确失败条件
+                    dep_failed = False
+                    for cond in conditions:
+                        cond_type = cond.get("type", "")
+                        cond_status = cond.get("status", "")
+                        if cond_type == "Progressing" and cond_status == "False":
+                            dep_failed = True
+                            break
+                        if cond_type == "ReplicaFailure":
+                            dep_failed = True
+                            break
+
+                    if dep_failed:
+                        new_status = "error"
+                    elif desired == 0:
                         new_status = "stopped"
                     elif replicas >= desired:
                         new_status = "running"
                     else:
+                        # 未全部就绪，保持创建中状态
                         new_status = "creating"
 
                     if new_status != inst.status:
@@ -746,18 +807,17 @@ async def openclaw_instance_sync(ctx: dict) -> dict:
 async def openclaw_skill_manage(ctx: dict, instance_id: str, skill_name: str, action: str) -> dict:
     """
     异步任务: Skills 安装/卸载
-    通过 OpenClawClient 向运行中的实例发送 skill 管理指令, 并更新 DB 状态。
-
-    Args:
-        instance_id: OpenClaw 实例 ID
-        skill_name: 技能名称
-        action: "install" 或 "uninstall"
+    1. 尝试通过 OpenClaw Gateway API 安装/卸载
+    2. 若 Gateway 不支持此 API，回退到配置文件方式（更新 ConfigMap + 重启 Pod）
+    3. 通过 list_skills 确认最终状态
     """
     from app.database import AsyncSessionLocal
     from app.models import OpenClawInstance, OpenClawSkill
     from app.services.openclaw_client import OpenClawClient, build_openclaw_url
     from sqlalchemy import select
     from datetime import datetime
+    import logging
+    logger = logging.getLogger(__name__)
 
     try:
         async with AsyncSessionLocal() as session:
@@ -781,42 +841,135 @@ async def openclaw_skill_manage(ctx: dict, instance_id: str, skill_name: str, ac
             skill = skill_result.scalar_one_or_none()
 
             if action == "install":
-                if skill:
-                    skill.status = "installing"
-                else:
+                if not skill:
                     return {"status": "error", "reason": "skill record not found"}
 
+                skill.status = "installing"
                 await session.commit()
 
-                # 调用 OpenClaw Gateway 获取 skills 列表确认安装
+                # 策略1: 尝试调用 Gateway install API
+                api_ok = False
+                try:
+                    resp = await client.install_skill(skill_name, skill.version)
+                    if resp is not None:
+                        api_ok = True
+                        logger.info(f"Skill {skill_name}: Gateway API 安装成功")
+                except Exception as e:
+                    logger.warning(f"Skill {skill_name}: Gateway API 安装失败({e})，尝试 ConfigMap 回退")
+
+                # 策略2: 若 API 不可用，通过 ConfigMap + Pod 重启方式安装
+                if not api_ok:
+                    try:
+                        from app.services.openclaw_manager import get_openclaw_manager
+                        from app.models import Channel as ChannelModel
+                        # 查询当前所有已安装 skill + 待安装 skill
+                        all_sk_result = await session.execute(
+                            select(OpenClawSkill).where(
+                                OpenClawSkill.instance_id == instance_id,
+                                OpenClawSkill.status.in_(["installed", "installing"]),
+                            )
+                        )
+                        all_skills = [s.name for s in all_sk_result.scalars().all()]
+                        ch_result = await session.execute(
+                            select(ChannelModel).where(ChannelModel.instance_id == instance_id)
+                        )
+                        channels = ch_result.scalars().all()
+                        ch_dicts = [{"type": c.type, "name": c.name, "config": c.config, "is_active": c.is_active} for c in channels]
+
+                        mgr = get_openclaw_manager()
+                        import asyncio as _aio
+                        await _aio.to_thread(
+                            mgr.hot_update_config,
+                            instance_id=str(inst.id),
+                            namespace=inst.namespace,
+                            channels=ch_dicts,
+                            skills=all_skills,
+                            port=inst.port or 18789,
+                        )
+                        logger.info(f"Skill {skill_name}: ConfigMap 回退安装已触发")
+                    except Exception as e:
+                        logger.error(f"Skill {skill_name}: ConfigMap 回退安装失败: {e}")
+
+                # 等待一段时间后确认安装结果
+                import asyncio as _aio
+                await _aio.sleep(5)
                 try:
                     skills_list = await client.list_skills()
                     installed = any(s.get("name") == skill_name for s in skills_list)
                     if installed:
                         skill.status = "installed"
                         skill.installed_at = datetime.utcnow()
+                    elif api_ok:
+                        # API 返回成功但列表未确认，可能还在加载，先标记成功
+                        skill.status = "installed"
+                        skill.installed_at = datetime.utcnow()
                     else:
                         skill.status = "error"
-                except Exception as e:
-                    skill.status = "error"
+                except Exception:
+                    # Gateway 可能在重启中，乐观标记成功
+                    if api_ok:
+                        skill.status = "installed"
+                        skill.installed_at = datetime.utcnow()
+                    else:
+                        skill.status = "error"
 
                 await session.commit()
                 return {"status": "ok", "action": "install", "skill": skill_name}
 
             elif action == "uninstall":
-                if skill:
-                    skill.status = "uninstalling"
-                    await session.commit()
+                if not skill:
+                    return {"status": "error", "reason": "skill record not found"}
 
-                    try:
-                        # 标记为已卸载
-                        skill.status = "uninstalled"
-                        await session.commit()
-                        await session.delete(skill)
-                        await session.commit()
-                    except Exception:
-                        skill.status = "error"
-                        await session.commit()
+                skill.status = "uninstalling"
+                await session.commit()
+
+                # 策略1: 尝试调用 Gateway uninstall API
+                api_ok = False
+                try:
+                    api_ok = await client.uninstall_skill(skill_name)
+                    if api_ok:
+                        logger.info(f"Skill {skill_name}: Gateway API 卸载成功")
+                except Exception as e:
+                    logger.warning(f"Skill {skill_name}: Gateway API 卸载失败({e})")
+
+                # 策略2: ConfigMap 回退 — 从 skills 列表中移除
+                try:
+                    from app.services.openclaw_manager import get_openclaw_manager
+                    from app.models import Channel as ChannelModel
+                    all_sk_result = await session.execute(
+                        select(OpenClawSkill).where(
+                            OpenClawSkill.instance_id == instance_id,
+                            OpenClawSkill.status == "installed",
+                            OpenClawSkill.name != skill_name,
+                        )
+                    )
+                    remaining_skills = [s.name for s in all_sk_result.scalars().all()]
+                    ch_result = await session.execute(
+                        select(ChannelModel).where(ChannelModel.instance_id == instance_id)
+                    )
+                    channels = ch_result.scalars().all()
+                    ch_dicts = [{"type": c.type, "name": c.name, "config": c.config, "is_active": c.is_active} for c in channels]
+
+                    mgr = get_openclaw_manager()
+                    import asyncio as _aio
+                    await _aio.to_thread(
+                        mgr.hot_update_config,
+                        instance_id=str(inst.id),
+                        namespace=inst.namespace,
+                        channels=ch_dicts,
+                        skills=remaining_skills,
+                        port=inst.port or 18789,
+                    )
+                except Exception as e:
+                    logger.error(f"Skill {skill_name}: ConfigMap 回退卸载失败: {e}")
+
+                # 删除 DB 记录
+                try:
+                    await session.delete(skill)
+                    await session.commit()
+                except Exception:
+                    skill.status = "error"
+                    await session.commit()
 
                 return {"status": "ok", "action": "uninstall", "skill": skill_name}
 

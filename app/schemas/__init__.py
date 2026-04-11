@@ -532,6 +532,11 @@ class SkillInstall(BaseModel):
     description: Optional[str] = None
 
 
+class SkillUpdate(BaseModel):
+    version: Optional[str] = None
+    description: Optional[str] = None
+
+
 class SkillResponse(BaseModel):
     id: UUID
     instance_id: UUID
@@ -582,6 +587,11 @@ class MonitorStatusResponse(BaseModel):
     skills_installed: int = 0
     health: bool = False
     ready: bool = False
+    # K8s 资源监控
+    cpu_usage_millicores: Optional[int] = None
+    memory_usage_bytes: Optional[int] = None
+    cpu_cores: Optional[int] = None      # 实例配置的 CPU 核数
+    memory_gb: Optional[int] = None      # 实例配置的内存 GB
 
 
 # ========== 资源套餐 Schemas ==========

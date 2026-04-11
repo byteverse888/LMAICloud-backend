@@ -18,6 +18,7 @@
   12.  billing_records 计费对象字段
   13.  ai_users 实例配额字段
   14.  审计日志支持登录失败记录
+  15.  OpenClaw 监控字段补全 (check_message)
 
 用法:
   cd LMAICloud-backend
@@ -649,6 +650,11 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     ("14. 审计日志支持登录失败记录 (login_failed + user_id nullable)", [
         "ALTER TYPE auditaction ADD VALUE IF NOT EXISTS 'LOGIN_FAILED'",
         "ALTER TABLE audit_logs ALTER COLUMN user_id DROP NOT NULL",
+    ]),
+
+    # ── 15. OpenClaw 监控字段补全 ─────────────────────
+    ("15. openclaw_model_keys 增加 check_message 字段", [
+        "ALTER TABLE openclaw_model_keys ADD COLUMN IF NOT EXISTS check_message VARCHAR(200)",
     ]),
 ]
 

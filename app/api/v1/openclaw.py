@@ -8,7 +8,7 @@ import json
 from uuid import UUID
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -22,7 +22,7 @@ from app.schemas import (
     OpenClawInstanceCreate, OpenClawInstanceResponse, OpenClawSpecUpdate,
     ModelKeyCreate, ModelKeyUpdate, ModelKeyResponse,
     ChannelCreate, ChannelUpdate, ChannelResponse,
-    SkillInstall, SkillResponse,
+    SkillInstall, SkillUpdate, SkillResponse,
     MonitorModelResponse, MonitorChannelResponse, MonitorStatusResponse,
 )
 from app.utils.auth import get_current_user
@@ -96,6 +96,7 @@ async def list_edge_nodes(
 @router.post("/instances", response_model=OpenClawInstanceResponse)
 async def create_instance(
     req: OpenClawInstanceCreate,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -281,10 +282,12 @@ async def create_instance(
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
+        from app.api.v1.audit_log import get_client_ip
         await create_audit_log(
             db, current_user.id, AuditAction.CREATE, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
             detail=f"镜像:{image}, 规格:{req.cpu_cores}C{req.memory_gb}G, 计费:{req.billing_type}",
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -319,7 +322,7 @@ async def list_instances(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取当前用户的 OpenClaw 实例列表"""
+    """获取当前用户的 OpenClaw 实例列表（含 K8s Pod IP 补充）"""
     result = await db.execute(
         select(OpenClawInstance)
         .where(OpenClawInstance.user_id == current_user.id)
@@ -327,22 +330,129 @@ async def list_instances(
         .order_by(OpenClawInstance.created_at.desc())
     )
     instances = result.scalars().all()
-    return {"list": instances, "total": len(instances)}
+
+    # ── K8s Pod IP 补充：对运行/创建中的实例，从 K8s 查询 Pod IP ──
+    ACTIVE_STATUSES = {"running", "creating", "starting", "stopping"}
+    active_instances = [i for i in instances if i.status in ACTIVE_STATUSES]
+    pod_ip_map: dict = {}  # instance_id -> ip
+    if active_instances:
+        try:
+            k8s = get_k8s_client()
+            if k8s.is_connected and not k8s.circuit_open:
+                pods = await asyncio.to_thread(
+                    k8s.list_pods,
+                    label_selector="app=openclaw",
+                    all_namespaces=True,
+                )
+                for p in (pods or []):
+                    labels = p.get("labels") or {}
+                    iid = labels.get("openclaw-instance")
+                    if iid:
+                        pod_ip_map[iid] = p.get("pod_ip") or p.get("ip")
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"获取 OpenClaw Pod IP 失败: {e}")
+
+    resp_list = []
+    for inst in instances:
+        inst_dict = OpenClawInstanceResponse.model_validate(inst).model_dump()
+        # 如果 DB 的 internal_ip 为空，则用 K8s Pod IP 补充
+        if not inst_dict.get("internal_ip"):
+            pod_ip = pod_ip_map.get(str(inst.id))
+            if pod_ip:
+                inst_dict["internal_ip"] = pod_ip
+                # 同时回写 DB（异步更新，不阻塞响应）
+                inst.internal_ip = pod_ip
+        resp_list.append(inst_dict)
+
+    # 批量提交 DB 更新
+    try:
+        await db.commit()
+    except Exception:
+        pass
+
+    return {"list": resp_list, "total": len(resp_list)}
 
 
-@router.get("/instances/{instance_id}", response_model=OpenClawInstanceResponse)
+@router.get("/instances/{instance_id}")
 async def get_instance(
     instance_id: UUID,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """获取 OpenClaw 实例详情"""
-    return await _get_instance_or_404(instance_id, current_user, db)
+    """获取 OpenClaw 实例详情（含 K8s Deployment/Pod 运行信息）"""
+    inst = await _get_instance_or_404(instance_id, current_user, db)
+    resp = OpenClawInstanceResponse.model_validate(inst).model_dump()
+
+    dep_info = None
+    pod_info_list = []
+
+    try:
+        k8s = get_k8s_client()
+        if k8s.is_connected:
+            inst_ns = inst.namespace or PodManager.user_namespace(str(inst.user_id))
+
+            # ── Deployment 信息 ──
+            dep_name = inst.deployment_name or f"oc-{str(instance_id).replace('-', '')[:8]}-deploy"
+            dep = await asyncio.to_thread(k8s.get_deployment, dep_name, inst_ns)
+            if dep:
+                dep_info = {
+                    "name": dep.get("name"),
+                    "replicas": dep.get("replicas") or 0,
+                    "ready_replicas": dep.get("ready_replicas") or 0,
+                    "available_replicas": dep.get("available_replicas") or 0,
+                    "updated_replicas": dep.get("updated_replicas") or 0,
+                    "images": dep.get("images") or [],
+                    "conditions": dep.get("conditions") or [],
+                    "created_at": dep.get("created_at"),
+                }
+
+            # ── Pod 列表 ──
+            pods = await asyncio.to_thread(
+                k8s.list_pods,
+                namespace=inst_ns,
+                label_selector=f"openclaw-instance={instance_id}",
+            )
+            for p in (pods or []):
+                pod_info_list.append({
+                    "name": p.get("name"),
+                    "status": p.get("effective_status") or p.get("status"),
+                    "ip": p.get("pod_ip"),
+                    "node_name": p.get("node_name"),
+                    "restart_count": p.get("restart_count", 0),
+                    "is_terminating": p.get("is_terminating", False),
+                    "containers": p.get("containers", []),
+                })
+
+            # 补充 IP
+            if pods:
+                pod_ip = pods[0].get("pod_ip")
+                pod_node = pods[0].get("node_name")
+                if pod_ip and not resp.get("internal_ip"):
+                    resp["internal_ip"] = pod_ip
+                    inst.internal_ip = pod_ip
+                if pod_node:
+                    resp["pod_node_name"] = pod_node
+    except Exception:
+        pass
+
+    resp["deployment_info"] = dep_info
+    resp["pod_info"] = pod_info_list
+    if not resp.get("deployment_name"):
+        resp["deployment_name"] = inst.deployment_name or f"oc-{str(instance_id).replace('-', '')[:8]}-deploy"
+
+    try:
+        await db.commit()
+    except Exception:
+        pass
+
+    return resp
 
 
 @router.delete("/instances/{instance_id}")
 async def delete_instance(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -378,9 +488,11 @@ async def delete_instance(
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
+        from app.api.v1.audit_log import get_client_ip
         await create_audit_log(
             db, current_user.id, AuditAction.DELETE, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -393,6 +505,7 @@ async def delete_instance(
 @router.post("/instances/{instance_id}/start")
 async def start_instance(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -426,9 +539,11 @@ async def start_instance(
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
+        from app.api.v1.audit_log import get_client_ip
         await create_audit_log(
             db, current_user.id, AuditAction.START, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -441,6 +556,7 @@ async def start_instance(
 @router.post("/instances/{instance_id}/stop")
 async def stop_instance(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -472,9 +588,11 @@ async def stop_instance(
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
+        from app.api.v1.audit_log import get_client_ip
         await create_audit_log(
             db, current_user.id, AuditAction.STOP, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
+            ip_address=get_client_ip(request),
         )
         await db.commit()
     except Exception as e:
@@ -867,6 +985,50 @@ async def uninstall_skill(
     return {"detail": f"技能 {skill_name} 正在卸载"}
 
 
+@router.put("/instances/{instance_id}/skills/{skill_id}", response_model=SkillResponse)
+async def update_skill(
+    instance_id: UUID,
+    skill_id: UUID,
+    req: SkillUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """更新技能（版本升级、修改描述）"""
+    inst = await _get_instance_or_404(instance_id, current_user, db)
+    result = await db.execute(
+        select(OpenClawSkill).where(
+            OpenClawSkill.id == skill_id,
+            OpenClawSkill.instance_id == inst.id,
+        )
+    )
+    skill = result.scalar_one_or_none()
+    if not skill:
+        raise HTTPException(status_code=404, detail="技能不存在")
+
+    version_changed = False
+    if req.description is not None:
+        skill.description = req.description
+    if req.version is not None and req.version != skill.version:
+        skill.version = req.version
+        version_changed = True
+
+    if version_changed:
+        skill.status = "installing"
+        await db.commit()
+        try:
+            await enqueue_task(
+                "openclaw_skill_manage",
+                str(inst.id), skill.name, "install",
+            )
+        except Exception:
+            pass
+    else:
+        await db.commit()
+
+    await db.refresh(skill)
+    return skill
+
+
 # ====================================================================
 #  监控查询
 # ====================================================================
@@ -950,6 +1112,8 @@ async def monitor_status(
         channels_total=len(channels),
         channels_online=sum(1 for c in channels if c.online_status == "online"),
         skills_installed=len(skills),
+        cpu_cores=inst.cpu_cores,
+        memory_gb=inst.memory_gb,
     )
 
     # 尝试从运行中的实例获取实时数据
@@ -969,6 +1133,25 @@ async def monitor_status(
     elif inst.status == "running":
         resp.health = True
 
+    # ── K8s Metrics: CPU / 内存监控 ──
+    if inst.status in ("running", "creating", "starting"):
+        try:
+            k8s = get_k8s_client()
+            if k8s.is_connected:
+                inst_ns = inst.namespace or PodManager.user_namespace(str(inst.user_id))
+                pod_metrics = await asyncio.to_thread(
+                    k8s.list_pod_metrics, namespace=inst_ns
+                )
+                dep_name = inst.deployment_name or f"oc-{str(inst.id)[:8]}"
+                prefix = dep_name
+                for pm in pod_metrics:
+                    if pm["name"].startswith(prefix):
+                        resp.cpu_usage_millicores = pm["cpu_usage_millicores"]
+                        resp.memory_usage_bytes = pm["memory_usage_bytes"]
+                        break
+        except Exception:
+            pass
+
     return resp
 
 
@@ -979,6 +1162,7 @@ async def monitor_status(
 @router.post("/instances/{instance_id}/restart")
 async def restart_instance(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -1007,24 +1191,26 @@ async def restart_instance(
 @router.delete("/instances/{instance_id}/force", summary="强制删除 OpenClaw 实例")
 async def force_delete_instance(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """强制删除：无论当前状态，直接清理 K8s 资源并标记为已删除"""
-    return await _do_force_delete(instance_id, current_user, db)
+    return await _do_force_delete(instance_id, current_user, db, request)
 
 
 @router.post("/instances/{instance_id}/force", summary="强制删除 OpenClaw 实例（POST 兼容入口）")
 async def force_delete_instance_post(
     instance_id: UUID,
+    request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """与 DELETE /force 等价，供不支持 DELETE 的反向代理环境使用"""
-    return await _do_force_delete(instance_id, current_user, db)
+    return await _do_force_delete(instance_id, current_user, db, request)
 
 
-async def _do_force_delete(instance_id: UUID, current_user: User, db: AsyncSession):
+async def _do_force_delete(instance_id: UUID, current_user: User, db: AsyncSession, request: Request = None):
     """强制删除核心逻辑：先 DB 标记 released，再后台清理 K8s"""
     result = await db.execute(
         select(OpenClawInstance)
@@ -1064,10 +1250,12 @@ async def _do_force_delete(instance_id: UUID, current_user: User, db: AsyncSessi
     try:
         from app.api.v1.audit_log import create_audit_log
         from app.models import AuditAction, AuditResourceType
+        from app.api.v1.audit_log import get_client_ip
         await create_audit_log(
             db, current_user.id, AuditAction.DELETE, AuditResourceType.OPENCLAW,
             resource_id=str(inst.id), resource_name=inst.name,
             detail="强制删除",
+            ip_address=get_client_ip(request) if request else None,
         )
         await db.commit()
     except Exception:

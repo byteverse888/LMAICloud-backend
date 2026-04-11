@@ -365,7 +365,7 @@ class K8sClient:
             return None
 
     @_k8s_retry(max_retries=1, delay=0.5)
-    def exec_interactive_stream(self, name: str, namespace: str, command: List[str], container: str = None):
+    def exec_interactive_stream(self, name: str, namespace: str, command: List[str], container: str = None, tty: bool = True):
         """打开 Pod 交互式 exec 流（用于 WebShell）"""
         if not self._initialized:
             return None
@@ -377,7 +377,7 @@ class K8sClient:
                 "stderr": True,
                 "stdin": True,
                 "stdout": True,
-                "tty": True,
+                "tty": tty,
                 "_preload_content": False,
             }
             if container:

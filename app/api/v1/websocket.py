@@ -9,7 +9,8 @@ from sqlalchemy import select
 import asyncio
 import json
 import uuid
-import threading
+import socket as _socket
+import time as _time
 from typing import Optional
 
 from app.database import get_db, async_session_maker
@@ -28,23 +29,68 @@ class TerminalManager:
     """终端会话管理器 - kubectl exec 模式"""
     
     def __init__(self):
-        self.active_connections: dict = {}  # instance_id -> WebSocket
-        self.exec_streams: dict = {}  # instance_id -> k8s exec stream
+        self.active_connections: dict = {}  # session_id -> WebSocket
+        self.exec_streams: dict = {}       # session_id -> k8s exec stream
+        self._last_resize: dict = {}       # session_id -> {"Width": cols, "Height": rows}
     
     async def connect(self, websocket: WebSocket, instance_id: str):
         await websocket.accept()
         self.active_connections[instance_id] = websocket
     
     def disconnect(self, instance_id: str):
+        """断开终端连接并清理 K8s exec 会话（阻塞方法，在线程中调用）"""
         if instance_id in self.active_connections:
             del self.active_connections[instance_id]
-        # 关闭 exec stream
-        if instance_id in self.exec_streams:
+        self._last_resize.pop(instance_id, None)
+
+        resp = self.exec_streams.pop(instance_id, None)
+        if not resp:
+            return
+
+        try:
+            if resp.is_open():
+                # 1. 发送 exit 命令让 shell 正常退出
+                try:
+                    resp.write_stdin("\x03")
+                    _time.sleep(0.1)
+                    resp.write_stdin("\nexit\n")
+                    resp.write_stdin("\x04")
+                except Exception:
+                    pass
+
+                # 2. 等待 shell 真正退出（最多 3 秒）
+                for _ in range(30):
+                    if not resp.is_open() or getattr(resp, 'returncode', None) is not None:
+                        break
+                    try:
+                        resp.update(timeout=0.1)
+                    except Exception:
+                        break
+
+            # 3. 正确关闭 K8s exec WebSocket 连接
             try:
-                self.exec_streams[instance_id].close()
-            except:
+                resp.close()
+            except Exception:
                 pass
-            del self.exec_streams[instance_id]
+
+            # 4. 确保底层 TCP 彻底关闭（KubeEdge 需要 FIN 传播到边缘）
+            try:
+                ws_sock = getattr(resp, 'sock', None)
+                if ws_sock:
+                    raw = getattr(ws_sock, 'sock', None)
+                    if raw:
+                        try:
+                            raw.shutdown(_socket.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        try:
+                            raw.close()
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"终端清理异常 - 会话: {instance_id}, 错误: {e}")
     
     async def send_message(self, instance_id: str, message: str):
         if instance_id in self.active_connections:
@@ -86,19 +132,79 @@ class TerminalManager:
             if not resp.is_open():
                 return None
             resp.update(timeout=timeout)
+
+            # 排空紧随的 status / close 帧
+            for _ in range(5):
+                if not resp.is_open() or getattr(resp, 'returncode', None) is not None:
+                    break
+                try:
+                    resp.update(timeout=0.01)
+                except Exception:
+                    break
+
+            stream_closed = not resp.is_open()
+            process_exited = getattr(resp, 'returncode', None) is not None
+
+            # 备用检查：底层 WebSocket 连接状态
+            if not stream_closed and not process_exited:
+                try:
+                    ws_sock = getattr(resp, 'sock', None)
+                    if ws_sock and not getattr(ws_sock, 'connected', True):
+                        stream_closed = True
+                except Exception:
+                    pass
+
             output = ""
             if resp.peek_stdout():
                 output += resp.read_stdout()
             if resp.peek_stderr():
                 output += resp.read_stderr()
-            return output   # 可能是 "" (暂无数据) 或实际输出
+
+            if stream_closed or process_exited:
+                return output if output else None
+
+            # 写探测：无输出时通过 resize channel 触发服务端检测死连接
+            # channel 4 是 RESIZE_CHANNEL，不会产生可见输出
+            if not output:
+                try:
+                    import json as _json
+                    dims = self._last_resize.get(instance_id, {"Width": 80, "Height": 24})
+                    resp.write_channel(4, _json.dumps(dims))
+                except Exception:
+                    return None
+                try:
+                    resp.update(timeout=0.15)
+                except Exception:
+                    return None
+                if not resp.is_open() or getattr(resp, 'returncode', None) is not None:
+                    remaining = ""
+                    if resp.peek_stdout():
+                        remaining += resp.read_stdout()
+                    if resp.peek_stderr():
+                        remaining += resp.read_stderr()
+                    return remaining if remaining else None
+
+            return output
         except Exception as e:
             logger.error(f"read_from_exec 异常 - 实例: {instance_id}, 错误: {e}")
             return None
 
     def resize_exec(self, instance_id: str, cols: int, rows: int):
-        """调整 exec 终端大小（K8s exec 不直接支持 resize，忽略）"""
-        pass
+        """调整 exec 终端 PTY 大小（通过 K8s exec 协议的 channel 4 发送 resize）"""
+        if instance_id not in self.exec_streams:
+            return
+        self._last_resize[instance_id] = {"Width": cols, "Height": rows}
+        try:
+            resp = self.exec_streams[instance_id]
+            if not resp.is_open():
+                return
+            # K8s exec WebSocket 协议：channel 4 = RESIZE_CHANNEL
+            # 发送 JSON {"Width": cols, "Height": rows}
+            import json as _json
+            resize_msg = _json.dumps({"Width": cols, "Height": rows})
+            resp.write_channel(4, resize_msg)
+        except Exception as e:
+            logger.debug(f"resize_exec 失败: {instance_id}, {e}")
 
 
 terminal_manager = TerminalManager()
@@ -258,7 +364,7 @@ async def websocket_terminal(
         except:
             pass
     finally:
-        terminal_manager.disconnect(session_id)
+        await asyncio.to_thread(terminal_manager.disconnect, session_id)
 
 
 @router.websocket("/ws/openclaw/terminal/{instance_id}")
@@ -397,7 +503,7 @@ async def websocket_openclaw_terminal(
         except:
             pass
     finally:
-        terminal_manager.disconnect(session_id)
+        await asyncio.to_thread(terminal_manager.disconnect, session_id)
 
 
 @router.websocket("/ws/openclaw/admin/terminal/{instance_id}")
@@ -527,7 +633,7 @@ async def websocket_openclaw_admin_terminal(
         except:
             pass
     finally:
-        terminal_manager.disconnect(session_id)
+        await asyncio.to_thread(terminal_manager.disconnect, session_id)
 
 
 @router.websocket("/ws/logs/{instance_id}")

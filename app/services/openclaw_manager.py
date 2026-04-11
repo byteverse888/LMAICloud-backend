@@ -303,6 +303,7 @@ class OpenClawManager:
         memory_gb: int = 4,
         node_name: Optional[str] = None,
         node_type: str = "center",
+        model_keys: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         构建 OpenClaw Deployment（对齐官方 deployment.yaml 结构）。
@@ -366,8 +367,14 @@ class OpenClawManager:
                 },
             },
         ]
-        # 动态注入所有 provider API key（optional: true — Secret 中无此键时不报错）
-        for provider in ["ANTHROPIC", "OPENAI", "GEMINI", "OPENROUTER"]:
+        # 动态注入所有 provider API key（从 model_keys 提取 + 预置常见 provider，optional: true）
+        # 收集所有需要注入的 provider（预置 + 用户配置）
+        providers_set = {"ANTHROPIC", "OPENAI", "GEMINI", "OPENROUTER"}
+        for mk in (model_keys or []):
+            p = (mk.get("provider") or "").upper()
+            if p:
+                providers_set.add(p)
+        for provider in sorted(providers_set):
             env_vars.append({
                 "name": f"{provider}_API_KEY",
                 "valueFrom": {
@@ -570,6 +577,7 @@ class OpenClawManager:
             # 6. 创建 Deployment
             dep_spec = self.build_deployment(
                 instance_id, ns, image_url, port, cpu_cores, memory_gb, node_name, node_type,
+                model_keys=model_keys,
             )
             dep_name = self.k8s.create_deployment(ns, dep_spec)
             if not dep_name:
@@ -679,13 +687,35 @@ class OpenClawManager:
         gateway_token: str,
         model_keys: List[Dict],
     ) -> bool:
-        """热更新 Secret → 自动触发 Deployment 滚动重启"""
+        """热更新 Secret → patch Deployment env → 触发滚动重启"""
         name = self.resource_name(instance_id)
+        secret_name = f"{name}-env"
         secret_spec = self.build_env_secret(instance_id, namespace, gateway_token, model_keys)
         try:
-            self.k8s.core_v1.replace_namespaced_secret(f"{name}-env", namespace, secret_spec)
-            # 触发滚动重启
-            self.k8s.restart_deployment(f"{name}-deploy", namespace)
+            self.k8s.core_v1.replace_namespaced_secret(secret_name, namespace, secret_spec)
+
+            # 同步更新 Deployment env，确保新增 Provider 的 secretKeyRef 被引用
+            providers_set = {"ANTHROPIC", "OPENAI", "GEMINI", "OPENROUTER"}
+            for mk in (model_keys or []):
+                p = (mk.get("provider") or "").upper()
+                if p:
+                    providers_set.add(p)
+
+            env_vars = [
+                {"name": "HOME", "value": "/home/node"},
+                {"name": "OPENCLAW_CONFIG_DIR", "value": "/home/node/.openclaw"},
+                {"name": "NODE_ENV", "value": "production"},
+                {"name": "OPENCLAW_GATEWAY_TOKEN", "valueFrom": {
+                    "secretKeyRef": {"name": secret_name, "key": "OPENCLAW_GATEWAY_TOKEN"}}},
+            ]
+            for provider in sorted(providers_set):
+                env_vars.append({"name": f"{provider}_API_KEY", "valueFrom": {
+                    "secretKeyRef": {"name": secret_name, "key": f"{provider}_API_KEY", "optional": True}}})
+                env_vars.append({"name": f"{provider}_BASE_URL", "valueFrom": {
+                    "secretKeyRef": {"name": secret_name, "key": f"{provider}_BASE_URL", "optional": True}}})
+
+            patch_body = {"spec": {"template": {"spec": {"containers": [{"name": "gateway", "env": env_vars}]}}}}
+            self.k8s.update_deployment(f"{name}-deploy", namespace, patch_body)
             return True
         except Exception:
             return False

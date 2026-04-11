@@ -536,6 +536,7 @@ class ModelKey(Base):
     # 监控字段（由 ARQ 定时任务回写）
     last_check_at = Column(DateTime)
     check_status = Column(String(20), default="unknown")  # ok/error/quota_low/unknown
+    check_message = Column(String(200))  # 监控检测说明信息
     balance = Column(Float)  # 余额（如果 provider 支持查询）
     tokens_used = Column(BigInteger, default=0)  # 累计 Token 消耗
 

@@ -278,6 +278,7 @@ async def list_instances(
 
     # 构建响应列表，注入 K8s 真实状态 + Deployment 信息
     resp_list = []
+    db_status_changed = False   # 跟踪是否需要回写 DB
     for inst in instances:
         inst_dict = InstanceResponse.model_validate(inst).model_dump()
         inst_id = str(inst.id)
@@ -286,16 +287,27 @@ async def list_instances(
         if inst.status in ACTIVE_STATUSES and k8s_queried:
             if dep:
                 # Deployment 存在 → 使用 _derive_instance_status 推导真实状态
-                inst_dict["status"] = _derive_instance_status(dep, db_status=inst.status)
+                derived = _derive_instance_status(dep, db_status=inst.status)
+                inst_dict["status"] = derived
+                # 状态与 DB 不一致时回写，确保下次查询即使 K8s 不可用也能返回正确状态
+                if derived != inst.status:
+                    inst.status = derived
+                    if derived == InstanceStatus.RUNNING and not inst.started_at:
+                        inst.started_at = datetime.utcnow()
+                    db_status_changed = True
             elif inst.status == InstanceStatus.CREATING:
                 # 创建中 Deployment 尚不存在（后台任务可能还没跑完）
                 created = inst.created_at.replace(tzinfo=timezone.utc) if inst.created_at and inst.created_at.tzinfo is None else inst.created_at
                 if created and (now_utc - created) > CREATING_TIMEOUT:
                     inst_dict["status"] = InstanceStatus.ERROR  # 超时
+                    inst.status = InstanceStatus.ERROR
+                    db_status_changed = True
                 # else: 保持 creating
             elif inst.status in {InstanceStatus.RUNNING, InstanceStatus.STARTING}:
                 # Deployment 在 K8s 中已不存在 → 标记为 error（Pod/Deployment 已消失）
                 inst_dict["status"] = InstanceStatus.ERROR
+                inst.status = InstanceStatus.ERROR
+                db_status_changed = True
             # stopping 状态保留（等待后台任务完成删除）
 
         # 附加 Deployment 运行时信息（供前端展示）
@@ -322,6 +334,13 @@ async def list_instances(
         inst_dict["memory_usage_bytes"] = mem_bytes
 
         resp_list.append(inst_dict)
+
+    # K8s 状态与 DB 不一致时回写，避免下次 K8s 查询失败时返回过时状态
+    if db_status_changed:
+        try:
+            await db.commit()
+        except Exception:
+            pass  # 回写失败不影响响应，同步任务会补救
 
     return PaginatedResponse(
         list=resp_list,

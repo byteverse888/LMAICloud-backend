@@ -1,0 +1,8 @@
+# local-storage-class.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openclaw-edge-local
+provisioner: kubernetes.io/no-provisioner  # 本地存储需手动创建 PV 或使用 local-static-provisioner
+volumeBindingMode: WaitForFirstConsumer   # 关键：延迟绑定到边缘节点
+reclaimPolicy: Delete

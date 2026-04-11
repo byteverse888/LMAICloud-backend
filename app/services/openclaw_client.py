@@ -115,6 +115,43 @@ class OpenClawClient:
             pass
         return []
 
+    async def install_skill(self, skill_name: str, version: Optional[str] = None) -> Optional[Dict]:
+        """
+        POST /api/skills — 安装技能
+        OpenClaw Gateway 提供的 skill 安装 API。
+        若 Gateway 不支持此接口，回退到配置文件方式。
+        """
+        try:
+            body: Dict[str, Any] = {"name": skill_name}
+            if version:
+                body["version"] = version
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.post(
+                    f"{self.base_url}/api/skills",
+                    headers=self._headers(),
+                    json=body,
+                )
+                if r.status_code in (200, 201):
+                    return r.json() if r.text else {"status": "ok"}
+        except Exception:
+            pass
+        return None
+
+    async def uninstall_skill(self, skill_name: str) -> bool:
+        """
+        DELETE /api/skills/{name} — 卸载技能
+        若 Gateway 不支持此接口，回退到配置文件方式。
+        """
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.delete(
+                    f"{self.base_url}/api/skills/{skill_name}",
+                    headers=self._headers(),
+                )
+                return r.status_code in (200, 204)
+        except Exception:
+            return False
+
     # ========== Cron ==========
 
     async def list_cron_jobs(self) -> List[Dict]:

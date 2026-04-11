@@ -261,6 +261,7 @@ async def pod_exec_terminal(ws: WebSocket, ns: str, name: str):
         return
 
     await ws.send_json({"type": "connected", "data": f"已连接 {ns}/{name}"})
+    last_resize = {"Width": 80, "Height": 24}
 
     async def read_stream():
         """从 K8s stream 读取输出发送到 WebSocket（线程安全）"""
@@ -269,17 +270,61 @@ async def pod_exec_terminal(ws: WebSocket, ns: str, name: str):
                 def _poll():
                     if not stream.is_open():
                         return None  # 流已关闭
-                    stream.update(timeout=1)
+                    stream.update(timeout=0.5)
+
+                    # 排空紧随的 status / close 帧
+                    for _ in range(5):
+                        if not stream.is_open() or getattr(stream, 'returncode', None) is not None:
+                            break
+                        try:
+                            stream.update(timeout=0.01)
+                        except Exception:
+                            break
+
+                    if not stream.is_open() or getattr(stream, 'returncode', None) is not None:
+                        out = ""
+                        if stream.peek_stdout():
+                            out += stream.read_stdout()
+                        if stream.peek_stderr():
+                            out += stream.read_stderr()
+                        return out if out else None
+
                     out = ""
                     if stream.peek_stdout():
                         out += stream.read_stdout()
                     if stream.peek_stderr():
                         out += stream.read_stderr()
+
+                    # 写探测：无输出时通过 resize channel 触发服务端检测死连接
+                    # channel 4 是 RESIZE_CHANNEL，不会产生可见输出
+                    if not out:
+                        try:
+                            import json as _j
+                            stream.write_channel(4, _j.dumps(last_resize))
+                        except Exception:
+                            return None
+                        try:
+                            stream.update(timeout=0.15)
+                        except Exception:
+                            return None
+                        if not stream.is_open() or getattr(stream, 'returncode', None) is not None:
+                            remaining = ""
+                            if stream.peek_stdout():
+                                remaining += stream.read_stdout()
+                            if stream.peek_stderr():
+                                remaining += stream.read_stderr()
+                            return remaining if remaining else None
+
                     return out if out else ""
 
                 data = await asyncio.to_thread(_poll)
                 if data is None:
                     logger.info(f"read_stream 流已关闭 - pod: {ns}/{name}")
+                    try:
+                        await ws.send_json({"type": "info", "data": "终端会话已结束"})
+                        await ws.close(code=1000, reason="Shell exited")
+                    except Exception:
+                        pass
                     break
                 if data:
                     await ws.send_json({"type": "output", "data": data})
@@ -300,8 +345,16 @@ async def pod_exec_terminal(ws: WebSocket, ns: str, name: str):
                 if stream.is_open():
                     await asyncio.to_thread(stream.write_stdin, data.get("data", ""))
             elif data.get("type") == "resize":
-                # K8s exec resize 需要通过 channel
-                pass
+                # K8s exec resize 通过 channel 4
+                cols = data.get("cols", 80)
+                rows = data.get("rows", 24)
+                last_resize.update({"Width": cols, "Height": rows})
+                try:
+                    import json as _json
+                    resize_msg = _json.dumps({"Width": cols, "Height": rows})
+                    await asyncio.to_thread(stream.write_channel, 4, resize_msg)
+                except Exception:
+                    pass
             elif data.get("type") == "ping":
                 await ws.send_json({"type": "pong"})
     except WebSocketDisconnect:
@@ -310,7 +363,45 @@ async def pod_exec_terminal(ws: WebSocket, ns: str, name: str):
         pass
     finally:
         read_task.cancel()
-        try:
-            stream.close()
-        except Exception:
-            pass
+        def _cleanup_stream():
+            import socket as _sock
+            try:
+                if stream.is_open():
+                    try:
+                        stream.write_stdin("\x03")
+                        import time as _time
+                        _time.sleep(0.1)
+                        stream.write_stdin("\nexit\n")
+                        stream.write_stdin("\x04")
+                    except Exception:
+                        pass
+                    for _ in range(30):
+                        if not stream.is_open() or getattr(stream, 'returncode', None) is not None:
+                            break
+                        try:
+                            stream.update(timeout=0.1)
+                        except Exception:
+                            break
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+            # 确保底层 TCP 彻底关闭
+            try:
+                ws_s = getattr(stream, 'sock', None)
+                if ws_s:
+                    raw = getattr(ws_s, 'sock', None)
+                    if raw:
+                        try:
+                            raw.shutdown(_sock.SHUT_RDWR)
+                        except OSError:
+                            pass
+                        try:
+                            raw.close()
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+        await asyncio.to_thread(_cleanup_stream)
