@@ -47,19 +47,25 @@ async def list_pods(
             namespace=namespace or "default",
             all_namespaces=all_ns,
         )
-        dep_name_map = {}
+        dep_info_map = {}
         for d in deps:
             iname = d.get("instance_name") or ""
+            iid = d.get("instance_id") or ""
+            oc_iid = d.get("openclaw_instance_id") or ""
             if iname:
-                dep_name_map[d["name"]] = iname
+                dep_info_map[d["name"]] = {"instance_name": iname, "instance_id": iid, "openclaw_instance_id": oc_iid}
         for p in pods:
             if not p.get("instance_name"):
                 # Pod 名格式: {deployment_name}-{replicaset_hash}-{random}
                 # 尝试匹配 deployment name 前缀
                 pod_name = p["name"]
-                for dep_n, inst_n in dep_name_map.items():
+                for dep_n, dep_info in dep_info_map.items():
                     if pod_name.startswith(dep_n + "-"):
-                        p["instance_name"] = inst_n
+                        p["instance_name"] = dep_info["instance_name"]
+                        if not p.get("instance_id"):
+                            p["instance_id"] = dep_info["instance_id"]
+                        if not p.get("openclaw_instance_id"):
+                            p["openclaw_instance_id"] = dep_info["openclaw_instance_id"]
                         break
     except Exception:
         pass  # 补充失败不影响主列表
@@ -219,29 +225,8 @@ async def pod_exec_terminal(ws: WebSocket, ns: str, name: str):
         await ws.close()
         return
 
-    # 检测可用 shell（边缘节点通过 CloudCore 隧道延迟较大，需容错+超时保护）
-    # 优化策略：优先检测 /bin/sh，如果能连接直接使用；
-    # 如果超时说明网络慢而非 shell 不存在，跳过 /bin/bash 检测直接用 /bin/sh
-    shell_cmd = ["/bin/sh"]  # 默认 fallback
-    for sh in ["/bin/sh", "/bin/bash"]:
-        try:
-            test = await asyncio.wait_for(
-                asyncio.to_thread(
-                    k8s.exec_in_pod, name, ns, [sh, "-c", "echo __shell_ok__"], container
-                ),
-                timeout=5,
-            )
-            if test is not None and "__shell_ok__" in test:
-                shell_cmd = [sh]
-                break
-        except asyncio.TimeoutError:
-            logger.warning(f"shell 检测超时 - pod: {ns}/{name}, shell: {sh}")
-            if sh == "/bin/sh":
-                # /bin/sh 超时说明网络慢，跳过后续检测直接用 /bin/sh
-                break
-        except Exception as e:
-            logger.warning(f"shell 检测失败 - pod: {ns}/{name}, shell: {sh}, 错误: {e}")
-
+    # 直接使用 /bin/sh 创建交互式 exec 连接（跳过 shell 检测，避免边缘节点延迟）
+    shell_cmd = [container_shell] if (container_shell := ws.query_params.get("shell")) else ["/bin/sh"]
     try:
         stream = await asyncio.wait_for(
             asyncio.to_thread(

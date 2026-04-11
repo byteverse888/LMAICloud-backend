@@ -242,14 +242,12 @@ async def websocket_terminal(
         await websocket.close(code=4001, reason="Invalid token")
         return
     
-    # 验证实例归属
+    # 验证实例归属（管理员可访问任意实例）
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(Instance).where(
-                Instance.id == instance_id,
-                Instance.user_id == user.id
-            )
-        )
+        query = select(Instance).where(Instance.id == instance_id)
+        if user.role != "admin":
+            query = query.where(Instance.user_id == user.id)
+        result = await session.execute(query)
         instance = result.scalar_one_or_none()
         
         if not instance:
@@ -383,14 +381,12 @@ async def websocket_openclaw_terminal(
         await websocket.close(code=4001, reason="Invalid token")
         return
 
-    # 验证实例归属
+    # 验证实例归属（管理员可访问任意实例）
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(OpenClawInstance).where(
-                OpenClawInstance.id == instance_id,
-                OpenClawInstance.user_id == user.id
-            )
-        )
+        query = select(OpenClawInstance).where(OpenClawInstance.id == instance_id)
+        if user.role != "admin":
+            query = query.where(OpenClawInstance.user_id == user.id)
+        result = await session.execute(query)
         instance = result.scalar_one_or_none()
 
         if not instance:
@@ -659,14 +655,12 @@ async def websocket_logs(
         await websocket.close(code=4001, reason="Invalid token")
         return
     
-    # 验证实例归属
+    # 验证实例归属（管理员可访问任意实例）
     async with async_session_maker() as session:
-        result = await session.execute(
-            select(Instance).where(
-                Instance.id == instance_id,
-                Instance.user_id == user.id
-            )
-        )
+        query = select(Instance).where(Instance.id == instance_id)
+        if user.role != "admin":
+            query = query.where(Instance.user_id == user.id)
+        result = await session.execute(query)
         instance = result.scalar_one_or_none()
         
         if not instance:

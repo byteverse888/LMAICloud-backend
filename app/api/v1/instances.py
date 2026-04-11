@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.database import get_db, AsyncSessionLocal
-from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus, OpenClawInstance
+from app.models import User, Instance, InstanceStatus, AppImage, Order, OrderType, OrderStatus, OpenClawInstance, UserRole
 from app.schemas import (
     InstanceCreate, InstanceResponse, ResourceConfigResponse, PaginatedResponse,
     InstanceRename,
@@ -660,12 +660,11 @@ async def get_instance(
     返回 DB 基础信息 + K8s Deployment 状态 + 关联 Pod 信息，
     前端可直接使用 deployment_info / pod_info 展示运行状态。
     """
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    # 管理员可查看任意实例，普通用户只能查看自己的
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -744,12 +743,10 @@ async def start_instance(
     db: AsyncSession = Depends(get_db)
 ):
     """启动实例"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -845,12 +842,10 @@ async def rename_instance(
     db: AsyncSession = Depends(get_db),
 ):
     """修改实例名称"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id,
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -900,12 +895,10 @@ async def stop_instance(
     db: AsyncSession = Depends(get_db)
 ):
     """停止实例"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -979,12 +972,10 @@ async def _do_force_delete(instance_id: str, current_user: User, db: AsyncSessio
     先更新 DB 状态为 released（确保立即响应），
     再通过后台任务清理 K8s 资源（Deployment + Service），避免 K8s 操作阻塞请求。
     """
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -1046,12 +1037,10 @@ async def release_instance(
     db: AsyncSession = Depends(get_db)
 ):
     """删除实例"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -1193,12 +1182,10 @@ async def get_instance_status(
     db: AsyncSession = Depends(get_db)
 ):
     """获取实例对应 Deployment 和 Pod 的运行时状态"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -1264,12 +1251,10 @@ async def get_instance_metrics(
     db: AsyncSession = Depends(get_db)
 ):
     """获取实例监控指标 - 通过 K8s Metrics API（等价于 kubectl top pod）"""
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")
@@ -1314,12 +1299,10 @@ async def get_instance_logs(
 ):
     """获取实例 Pod 日志"""
     # 验证实例归属
-    result = await db.execute(
-        select(Instance).where(
-            Instance.id == instance_id,
-            Instance.user_id == current_user.id
-        )
-    )
+    query = select(Instance).where(Instance.id == instance_id)
+    if current_user.role != UserRole.ADMIN:
+        query = query.where(Instance.user_id == current_user.id)
+    result = await db.execute(query)
     instance = result.scalar_one_or_none()
     if not instance:
         raise HTTPException(status_code=404, detail="实例不存在")

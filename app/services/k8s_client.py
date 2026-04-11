@@ -439,6 +439,7 @@ class K8sClient:
             "annotations": annotations,
             "instance_name": annotations.get("lmaicloud/instance-name", ""),
             "instance_id": pod_labels.get("instance-id", ""),
+            "openclaw_instance_id": pod_labels.get("openclaw-instance", ""),
             "status": phase,                    # 原始 K8s Phase（供过滤/筛选用）
             "effective_status": effective_status,  # 业务状态（考虑容器就绪和 Terminating）
             "is_terminating": is_terminating,
@@ -923,6 +924,7 @@ class K8sClient:
             "namespace": dep.metadata.namespace,
             "instance_name": annotations.get("lmaicloud/instance-name", ""),
             "instance_id": labels.get("instance-id", ""),
+            "openclaw_instance_id": labels.get("openclaw-instance", ""),
             "annotations": annotations,
             "replicas": dep.spec.replicas or 0,
             "ready_replicas": dep.status.ready_replicas or 0,

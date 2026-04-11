@@ -16,7 +16,7 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.models import (
     AIUser as User, OpenClawInstance, ModelKey, Channel, OpenClawSkill,
-    Order, OrderType, OrderStatus, Instance,
+    Order, OrderType, OrderStatus, Instance, UserRole,
 )
 from app.schemas import (
     OpenClawInstanceCreate, OpenClawInstanceResponse, OpenClawSpecUpdate,
@@ -42,13 +42,11 @@ router = APIRouter()
 async def _get_instance_or_404(
     instance_id: UUID, user: User, db: AsyncSession
 ) -> OpenClawInstance:
-    """获取实例，校验归属权"""
-    result = await db.execute(
-        select(OpenClawInstance).where(
-            OpenClawInstance.id == instance_id,
-            OpenClawInstance.user_id == user.id,
-        )
-    )
+    """获取实例，校验归属权（管理员可查看任意实例）"""
+    query = select(OpenClawInstance).where(OpenClawInstance.id == instance_id)
+    if user.role != UserRole.ADMIN:
+        query = query.where(OpenClawInstance.user_id == user.id)
+    result = await db.execute(query)
     inst = result.scalar_one_or_none()
     if not inst:
         raise HTTPException(status_code=404, detail="OpenClaw 实例不存在")
