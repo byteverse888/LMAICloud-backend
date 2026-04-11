@@ -1,11 +1,14 @@
 """公开的系统信息 API（无需认证）"""
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import json
+from pathlib import Path
 
 from app.database import get_db
 from app.models import SystemSetting
+from app.config import settings as app_settings
 
 router = APIRouter()
 
@@ -42,6 +45,38 @@ async def get_site_info(db: AsyncSession = Depends(get_db)):
         "captcha_enabled": db_settings.get("captcha_enabled", True),
         "announcement_text": db_settings.get("announcement_text", ""),
     }
+
+
+@router.get("/logo/{filename}")
+async def get_logo(filename: str):
+    """提供 Logo 静态文件访问（无需认证）"""
+    # 安全校验：防止路径遍历
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="无效的文件名")
+    
+    logo_dir = Path(app_settings.storage_root) / "_system" / "logos"
+    filepath = logo_dir / filename
+    
+    if not filepath.exists() or not filepath.is_file():
+        raise HTTPException(status_code=404, detail="Logo 不存在")
+    
+    # 根据后缀判断 MIME 类型
+    suffix = filepath.suffix.lower()
+    media_types = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".svg": "image/svg+xml",
+        ".webp": "image/webp",
+        ".ico": "image/x-icon",
+    }
+    media_type = media_types.get(suffix, "application/octet-stream")
+    
+    return FileResponse(
+        filepath,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.get("/agreements")

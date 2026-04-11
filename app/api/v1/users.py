@@ -13,6 +13,7 @@ router = APIRouter()
 
 class UserProfileUpdate(BaseModel):
     nickname: Optional[str] = None
+    phone: Optional[str] = None
     avatar: Optional[str] = None
 
 
@@ -31,6 +32,8 @@ async def patch_me(
     """更新当前用户资料"""
     if data.nickname is not None:
         current_user.nickname = data.nickname
+    if data.phone is not None:
+        current_user.phone = data.phone
     if data.avatar is not None:
         current_user.avatar = data.avatar
     await db.commit()

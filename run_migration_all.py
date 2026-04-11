@@ -360,7 +360,7 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
            )""",
 
         """INSERT INTO system_settings (key, value, description) VALUES
-               ('site_name',          '"\u9f99\u867e\u4e91"',                              '\u7ad9\u70b9\u540d\u79f0')
+               ('site_name',          '"龙虾云"',                              '站点名称'),
                ('site_description',   '"大模型AI算力云平台"',                       '站点描述'),
                ('site_logo',          '""',                                       '站点Logo URL'),
                ('contact_email',      '"support@lmaicloud.com"',                  '客服邮箱'),
@@ -368,7 +368,7 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
                ('icp_number',         '""',                                       'ICP备案号'),
                ('icp_link',           '"https://beian.miit.gov.cn/"',             'ICP备案链接'),
                ('police_number',      '""',                                       '公安备案号'),
-               ('copyright_text',     '"© 2026 \u9f99\u867e\u4e91. All rights reserved."', '\u7248\u6743\u4fe1\u606f')
+               ('copyright_text',     '"© 2026 龙虾云. All rights reserved."', '版权信息'),
                ('captcha_enabled',    'true',                                     '是否启用登录验证码'),
                ('user_agreement',     '""',                                       '用户协议'),
                ('privacy_policy',     '""',                                       '隐私政策'),
@@ -655,6 +655,11 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
     # ── 15. OpenClaw 监控字段补全 ─────────────────────
     ("15. openclaw_model_keys 增加 check_message 字段", [
         "ALTER TABLE openclaw_model_keys ADD COLUMN IF NOT EXISTS check_message VARCHAR(200)",
+    ]),
+
+# ── 16. 用户手机号字段 ─────────────────────────
+    ("16. ai_users 增加 phone 字段", [
+        "ALTER TABLE ai_users ADD COLUMN IF NOT EXISTS phone VARCHAR(30)",
     ]),
 ]
 

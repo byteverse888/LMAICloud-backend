@@ -26,6 +26,7 @@ class AIUser(Base):
     email = Column(String(255), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)
     nickname = Column(String(100))
+    phone = Column(String(30), nullable=True)  # 手机号
     avatar = Column(String(500))
     role = Column(Enum(UserRole), default=UserRole.USER)
     balance = Column(Float, default=0.0)

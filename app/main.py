@@ -239,9 +239,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title=settings.app_name,
     description="""
-## LMAICloud GPU算力云平台 API
+## 龙虾云 GPU算力云平台 API
 
-LMAICloud 提供企业级GPU算力租用服务，支持以下功能：
+提供企业级GPU算力租用服务，支持以下功能：
 
 ### 核心功能
 - **实例管理**: 创建、启动、停止、释放 GPU 实例
@@ -264,7 +264,7 @@ LMAICloud 提供企业级GPU算力租用服务，支持以下功能：
     version="1.0.0",
     lifespan=lifespan,
     contact={
-        "name": "LMAICloud Support",
+        "name": "龙虾云 Support",
         "email": "support@lmaicloud.com",
     },
     license_info={

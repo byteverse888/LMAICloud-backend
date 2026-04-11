@@ -1,15 +1,19 @@
 """系统设置 API (管理端) - 数据库持久化存储"""
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel, EmailStr
 from typing import Dict, Any, Optional
 import json
+import os
+import uuid
+from pathlib import Path
 
 from app.database import get_db
 from app.models import SystemSetting
 from app.utils.auth import get_current_admin_user
 from app.services.email_service import send_test_email, get_email_config
+from app.config import settings as app_settings
 
 router = APIRouter()
 
@@ -249,6 +253,59 @@ async def update_settings(
     # 返回更新后的所有设置
     all_settings = await get_all_settings(db)
     return {"message": "设置已更新", "settings": all_settings}
+
+
+# Logo 上传目录
+LOGO_UPLOAD_DIR = Path(app_settings.storage_root) / "_system" / "logos"
+LOGO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+ALLOWED_LOGO_TYPES = {"image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/x-icon", "image/vnd.microsoft.icon"}
+MAX_LOGO_SIZE = 2 * 1024 * 1024  # 2MB
+
+
+@router.post("/upload-logo")
+async def upload_logo(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_admin_user),
+):
+    """上传平台 Logo 图片"""
+    # 校验文件类型
+    content_type = file.content_type or ""
+    if content_type not in ALLOWED_LOGO_TYPES:
+        await file.close()
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式: {content_type}，仅支持 PNG/JPG/SVG/WEBP/ICO")
+
+    # 读取文件
+    try:
+        data = await file.read()
+    finally:
+        await file.close()
+
+    if len(data) > MAX_LOGO_SIZE:
+        raise HTTPException(status_code=400, detail="Logo 文件过大，最大允许 2MB")
+    if len(data) == 0:
+        raise HTTPException(status_code=400, detail="文件为空")
+
+    # 生成文件名并保存
+    ext = os.path.splitext(file.filename or "logo.png")[1] or ".png"
+    filename = f"logo_{uuid.uuid4().hex[:8]}{ext}"
+    filepath = LOGO_UPLOAD_DIR / filename
+    filepath.write_bytes(data)
+
+    # 清理旧 logo 文件（只保留最新的）
+    for old_file in LOGO_UPLOAD_DIR.iterdir():
+        if old_file.name != filename and old_file.is_file():
+            try:
+                old_file.unlink()
+            except Exception:
+                pass
+
+    # 生成可访问的 URL并保存到设置
+    logo_url = f"/api/v1/system/logo/{filename}"
+    await set_setting(db, "site_logo", logo_url)
+    await db.commit()
+
+    return {"message": "Logo 上传成功", "url": logo_url}
 
 
 @router.get("/pricing")

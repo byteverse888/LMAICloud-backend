@@ -34,6 +34,7 @@ class UserResponse(BaseModel):
     id: UUID
     email: str
     nickname: Optional[str] = None
+    phone: Optional[str] = None
     avatar: Optional[str] = None
     role: str
     balance: float
