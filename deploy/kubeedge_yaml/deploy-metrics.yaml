@@ -1,3 +1,7 @@
+# Metrics Server v0.8.1
+# 提供 kubectl top / HPA 所需的资源监控数据
+# 部署在控制平面节点，通过 hostNetwork 避免 Pod 网络依赖
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -16,15 +20,9 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
   name: system:aggregated-metrics-reader
 rules:
-- apiGroups:
-  - metrics.k8s.io
-  resources:
-  - pods
-  - nodes
-  verbs:
-  - get
-  - list
-  - watch
+- apiGroups: ["metrics.k8s.io"]
+  resources: ["pods", "nodes"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -33,18 +31,12 @@ metadata:
     k8s-app: metrics-server
   name: system:metrics-server
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - pods
-  - nodes
-  - nodes/stats
-  - namespaces
-  - configmaps
-  verbs:
-  - get
-  - list
-  - watch
+- apiGroups: [""]
+  resources: ["nodes/metrics"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods", "nodes", "namespaces", "configmaps"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -131,48 +123,59 @@ spec:
       tolerations:
       - operator: Exists
       containers:
-      - args:
+      - name: metrics-server
+        image: registry.k8s.io/metrics-server/metrics-server:v0.8.1
+        imagePullPolicy: IfNotPresent
+        args:
         - --cert-dir=/tmp
-        - --secure-port=4443
+        - --secure-port=10250
         - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
         - --kubelet-use-node-status-port
         - --kubelet-insecure-tls
-        image: swr.cn-north-4.myhuaweicloud.com/ddn-k8s/k8s.gcr.io/metrics-server/metrics-server:v0.4.0
-        imagePullPolicy: IfNotPresent
+        - --metric-resolution=15s
+        ports:
+        - containerPort: 10250
+          name: https
+          protocol: TCP
         livenessProbe:
-          failureThreshold: 3
           httpGet:
             path: /livez
             port: https
             scheme: HTTPS
-          periodSeconds: 10
-        name: metrics-server
-        ports:
-        - containerPort: 4443
-          name: https
-          protocol: TCP
-        readinessProbe:
           failureThreshold: 3
+          periodSeconds: 10
+        readinessProbe:
           httpGet:
             path: /readyz
             port: https
             scheme: HTTPS
+          failureThreshold: 3
+          initialDelaySeconds: 20
           periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
         securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
           readOnlyRootFilesystem: true
           runAsNonRoot: true
           runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
         volumeMounts:
-        - mountPath: /tmp
-          name: tmp-dir
+        - name: tmp-dir
+          mountPath: /tmp
       nodeSelector:
         kubernetes.io/os: linux
         node-role.kubernetes.io/control-plane: ""
       priorityClassName: system-cluster-critical
       serviceAccountName: metrics-server
       volumes:
-      - emptyDir: {}
-        name: tmp-dir
+      - name: tmp-dir
+        emptyDir: {}
 ---
 apiVersion: apiregistration.k8s.io/v1
 kind: APIService

@@ -4760,6 +4760,14 @@ spec:
           operator: Exists
         - effect: NoExecute
           operator: Exists
+      # 禁止在 KubeEdge 边缘节点运行
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: node-role.kubernetes.io/edge
+                operator: DoesNotExist
       serviceAccountName: calico-node
       # Minimize downtime during a rolling upgrade or deletion; tell Kubernetes to do a "force
       # deletion": https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods.

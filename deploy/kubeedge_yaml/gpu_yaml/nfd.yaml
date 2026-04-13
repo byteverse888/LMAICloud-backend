@@ -1,10 +1,12 @@
-# This template contains an example of running nfd-master and nfd-worker in the
-# same pod.
-#
+# Node Feature Discovery v0.18.3
+# 用于检测节点硬件特性（GPU PCI vendor 等）并自动打标签
+# 部署方式: Deployment(master) + DaemonSet(worker)
+# 镜像: registry.k8s.io/nfd/node-feature-discovery:v0.18.3
+---
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: node-feature-discovery # NFD namespace
+  name: node-feature-discovery
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -12,19 +14,26 @@ metadata:
   name: nfd-master
   namespace: node-feature-discovery
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nfd-worker
+  namespace: node-feature-discovery
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: nfd-master
 rules:
-- apiGroups:
-  - ""
-  resources:
-  - nodes
-  verbs:
-  - get
-  - patch
-  - update
+- apiGroups: [""]
+  resources: ["nodes", "nodes/status"]
+  verbs: ["get", "patch", "update", "list"]
+- apiGroups: ["nfd.k8s-sigs.io"]
+  resources: ["nodefeatures", "nodefeaturerules", "nodefeaturegroups"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["create", "get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -39,73 +48,158 @@ subjects:
   name: nfd-master
   namespace: node-feature-discovery
 ---
-apiVersion: apps/v1
-kind: DaemonSet
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
 metadata:
-  labels:
-    app: nfd
-  name: nfd
+  name: nfd-worker
+rules:
+- apiGroups: ["nfd.k8s-sigs.io"]
+  resources: ["nodefeatures"]
+  verbs: ["create", "get", "update"]
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nfd-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: nfd-worker
+subjects:
+- kind: ServiceAccount
+  name: nfd-worker
   namespace: node-feature-discovery
+---
+# NFD Master - 运行在控制平面，处理特性标签
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfd-master
+  namespace: node-feature-discovery
+  labels:
+    app.kubernetes.io/name: node-feature-discovery
+    app.kubernetes.io/component: master
+    app.kubernetes.io/version: v0.18.3
 spec:
+  replicas: 1
   selector:
     matchLabels:
-      app: nfd
+      app.kubernetes.io/name: node-feature-discovery
+      app.kubernetes.io/component: master
   template:
     metadata:
       labels:
-        app: nfd
+        app.kubernetes.io/name: node-feature-discovery
+        app.kubernetes.io/component: master
     spec:
-      serviceAccount: nfd-master
+      serviceAccountName: nfd-master
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
       containers:
-        - env:
-          - name: NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
-          image: quay.io/kubernetes_incubator/node-feature-discovery:v0.6.0
-          name: nfd-master
-          command:
-            - "nfd-master"
-          args:
-            - "--extra-label-ns=nvidia.com"
-        - env:
-          - name: NODE_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: spec.nodeName
-          image: quay.io/kubernetes_incubator/node-feature-discovery:v0.6.0
-          name: nfd-worker
-          command:
-            - "nfd-worker"
-          args:
-            - "--sleep-interval=60s"
-            - "--options={\"sources\": {\"pci\": { \"deviceLabelFields\": [\"vendor\"] }}}"
-          volumeMounts:
-            - name: host-boot
-              mountPath: "/host-boot"
-              readOnly: true
-            - name: host-os-release
-              mountPath: "/host-etc/os-release"
-              readOnly: true
-            - name: host-sys
-              mountPath: "/host-sys"
-            - name: source-d
-              mountPath: "/etc/kubernetes/node-feature-discovery/source.d/"
-            - name: features-d
-              mountPath: "/etc/kubernetes/node-feature-discovery/features.d/"
-      volumes:
+      - name: nfd-master
+        image: registry.k8s.io/nfd/node-feature-discovery:v0.18.3
+        command: ["nfd-master"]
+        args:
+        - "--extra-label-ns=nvidia.com"
+        ports:
+        - containerPort: 8080
+          name: grpc
+        - containerPort: 8081
+          name: health
+        livenessProbe:
+          grpc:
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          grpc:
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+---
+# NFD Worker - 运行在每个需要特性检测的节点上
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nfd-worker
+  namespace: node-feature-discovery
+  labels:
+    app.kubernetes.io/name: node-feature-discovery
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/version: v0.18.3
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: node-feature-discovery
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: node-feature-discovery
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: nfd-worker
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+      - name: nfd-worker
+        image: registry.k8s.io/nfd/node-feature-discovery:v0.18.3
+        command: ["nfd-worker"]
+        args:
+        - "--sleep-interval=60s"
+        - "--sources=pci,usb,cpu,kernel,system"
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+        volumeMounts:
         - name: host-boot
-          hostPath:
-            path: "/boot"
+          mountPath: "/host-boot"
+          readOnly: true
         - name: host-os-release
-          hostPath:
-            path: "/etc/os-release"
+          mountPath: "/host-etc/os-release"
+          readOnly: true
         - name: host-sys
-          hostPath:
-            path: "/sys"
+          mountPath: "/host-sys"
+          readOnly: true
         - name: source-d
-          hostPath:
-            path: "/etc/kubernetes/node-feature-discovery/source.d/"
+          mountPath: "/etc/kubernetes/node-feature-discovery/source.d/"
+          readOnly: true
         - name: features-d
-          hostPath:
-            path: "/etc/kubernetes/node-feature-discovery/features.d/"
+          mountPath: "/etc/kubernetes/node-feature-discovery/features.d/"
+          readOnly: true
+      volumes:
+      - name: host-boot
+        hostPath:
+          path: "/boot"
+      - name: host-os-release
+        hostPath:
+          path: "/etc/os-release"
+      - name: host-sys
+        hostPath:
+          path: "/sys"
+      - name: source-d
+        hostPath:
+          path: "/etc/kubernetes/node-feature-discovery/source.d/"
+      - name: features-d
+        hostPath:
+          path: "/etc/kubernetes/node-feature-discovery/features.d/"

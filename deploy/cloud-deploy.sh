@@ -1,9 +1,9 @@
 #!/bin/bash
 #===============================================================================
 # LMAICloud 云主机 K8s + KubeEdge 一键部署脚本
-# 系统要求: Ubuntu 22.04 LTS
+# 系统要求: Ubuntu 22.04/24.04 LTS
 # 功能: K8s 单节点集群部署 + KubeEdge CloudCore 部署
-# 版本: K8s v1.31.x (最新稳定版) + KubeEdge v1.19.x (最新稳定版)
+# 版本: K8s v1.35.x + KubeEdge v1.22.x
 #===============================================================================
 
 set -e
@@ -188,8 +188,8 @@ check_system() {
     source /etc/os-release
     log_info "操作系统: $PRETTY_NAME"
     
-    if [[ "$ID" != "ubuntu" ]] || [[ ! "$VERSION_ID" =~ ^22\.04 ]]; then
-        log_warn "推荐使用 Ubuntu 22.04 LTS，当前系统: $PRETTY_NAME"
+    if [[ "$ID" != "ubuntu" ]] || [[ ! "$VERSION_ID" =~ ^(22|24)\.04 ]]; then
+        log_warn "推荐使用 Ubuntu 22.04/24.04 LTS，当前系统: $PRETTY_NAME"
     fi
     
     # 检查 CPU 和内存
@@ -401,6 +401,19 @@ EOF
         systemctl disable ufw
     fi
     
+    # Ubuntu 24.04: 放行 AppArmor 非特权用户命名空间限制 (containerd 需要)
+    if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+        CURRENT_VAL=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo "0")
+        if [[ "$CURRENT_VAL" != "0" ]]; then
+            log_info "放行 AppArmor 非特权用户命名空间限制..."
+            echo 0 > /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+            if ! grep -q 'apparmor_restrict_unprivileged_userns' /etc/sysctl.d/k8s.conf 2>/dev/null; then
+                echo 'kernel.apparmor_restrict_unprivileged_userns = 0' >> /etc/sysctl.d/k8s.conf
+                sysctl --system > /dev/null 2>&1
+            fi
+        fi
+    fi
+    
     # 设置时区
     timedatectl set-timezone Asia/Shanghai 2>/dev/null || true
     
@@ -471,20 +484,53 @@ install_containerd() {
         # 配置国内镜像加速
         if [[ "$USE_CN_MIRROR" == "true" ]]; then
             log_info "配置镜像加速..."
-            # K8s 组件镜像加速
-            sed -i 's|registry.k8s.io|registry.aliyuncs.com/google_containers|g' /etc/containerd/config.toml
             
-            # Docker Hub 镜像加速 (Calico等组件需要)
-            if ! grep -q 'registry.mirrors.*docker.io' /etc/containerd/config.toml; then
-                log_info "配置 Docker Hub 镜像加速..."
-                cat >> /etc/containerd/config.toml << 'EOF'
+            # 检测 containerd 主版本 (2.x 使用 hosts.toml，1.x 使用旧格式)
+            CONTAINERD_MAJOR=$(containerd --version 2>/dev/null | grep -oP 'containerd\.io \K\d+' || echo "1")
+            
+            if [[ "$CONTAINERD_MAJOR" -ge 2 ]]; then
+                # ── containerd 2.x: hosts.toml 格式 ──
+                log_info "检测到 containerd 2.x，使用 hosts.toml 镜像配置..."
+                
+                # 确保 config_path 已在 config.toml 中启用
+                if ! grep -q 'config_path.*certs.d' /etc/containerd/config.toml; then
+                    sed -i '/\[plugins.*registry\]/a\      config_path = "/etc/containerd/certs.d"' /etc/containerd/config.toml 2>/dev/null || true
+                fi
+                
+                # K8s 组件镜像加速
+                mkdir -p /etc/containerd/certs.d/registry.k8s.io
+                cat > /etc/containerd/certs.d/registry.k8s.io/hosts.toml << 'TOML'
+server = "https://registry.k8s.io"
+
+[host."https://registry.aliyuncs.com/google_containers"]
+  capabilities = ["pull", "resolve"]
+TOML
+                
+                # Docker Hub 镜像加速 (Calico 等组件需要)
+                mkdir -p /etc/containerd/certs.d/docker.io
+                cat > /etc/containerd/certs.d/docker.io/hosts.toml << 'TOML'
+server = "https://docker.io"
+
+[host."https://docker.m.daocloud.io"]
+  capabilities = ["pull", "resolve"]
+TOML
+            else
+                # ── containerd 1.x: 旧格式 ──
+                # K8s 组件镜像加速
+                sed -i 's|registry.k8s.io|registry.aliyuncs.com/google_containers|g' /etc/containerd/config.toml
+                
+                # Docker Hub 镜像加速 (Calico 等组件需要)
+                if ! grep -q 'registry.mirrors.*docker.io' /etc/containerd/config.toml; then
+                    log_info "配置 Docker Hub 镜像加速..."
+                    cat >> /etc/containerd/config.toml << 'EOF'
 
 # Docker Hub 镜像加速 - DaoCloud
 [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
   endpoint = ["https://docker.m.daocloud.io"]
 EOF
-            else
-                log_info "Docker Hub 镜像加速已配置"
+                else
+                    log_info "Docker Hub 镜像加速已配置"
+                fi
             fi
         fi
     fi
@@ -594,6 +640,11 @@ init_k8s_cluster() {
     log_info "配置 master 节点可调度..."
     kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
     
+    # 配置 kube-proxy 禁止在边缘节点运行
+    log_info "配置 kube-proxy 排除边缘节点..."
+    kubectl -n kube-system patch daemonset kube-proxy --type merge -p '
+    {"spec":{"template":{"spec":{"affinity":{"nodeAffinity":{"requiredDuringSchedulingIgnoredDuringExecution":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"node-role.kubernetes.io/edge","operator":"DoesNotExist"}]}]}}}}}}}' 2>/dev/null || true
+    
     log_info "K8s 集群初始化完成"
 }
 
@@ -612,7 +663,7 @@ install_network_plugin() {
     log_info "下载 Calico 配置文件..."
     
     # 下载 Calico manifest
-    CALICO_VERSION="v3.27.0"
+    CALICO_VERSION="v3.29.2"
     CALICO_FILE="calico.yaml"
     CALICO_URL="https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
