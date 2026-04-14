@@ -383,7 +383,14 @@ MIGRATIONS: list[tuple[str, list[str]]] = [
                ('maintenance_mode',          'false',  '维护模式'),
                ('registration_enabled',      'true',   '允许注册'),
                ('email_verification_required','true',  '邮箱验证必填'),
-               ('notification_email_enabled','true',   '通知邮件启用')
+               ('notification_email_enabled','true',   '通知邮件启用'),
+               ('smtp_host',              '""',                                       'SMTP服务器地址'),
+               ('smtp_port',              '465',                                       'SMTP端口(465=SSL)'),
+               ('smtp_user',              '""',                                       'SMTP用户名'),
+               ('smtp_password',          '""',                                       'SMTP密码/授权码'),
+               ('smtp_from_email',        '""',                                       '发件人邮箱'),
+               ('smtp_from_name',         '""',                                       '发件人名称(空则用site_name)'),
+               ('smtp_use_tls',           'false',                                     'STARTTLS(端口465时设为false)')
            ON CONFLICT (key) DO NOTHING""",
     ]),
 

@@ -56,12 +56,12 @@ class Settings(BaseSettings):
     
     # Email SMTP 配置 (可通过 .env 或数据库动态配置覆盖)
     smtp_host: str = ""
-    smtp_port: int = 587
+    smtp_port: int = 465
     smtp_user: str = ""
     smtp_password: str = ""
     smtp_from_email: str = ""
     smtp_from_name: str = ""  # 空则自动使用品牌配置中的平台名称
-    smtp_use_tls: bool = True
+    smtp_use_tls: bool = False  # 465端口走SSL，不需要STARTTLS
     
     # 邮箱激活令牌过期时间（小时）
     email_activation_expire_hours: int = 24

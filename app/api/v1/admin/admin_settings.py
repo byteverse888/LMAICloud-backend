@@ -36,12 +36,12 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "notification_email_enabled": True,
     # 邮件配置
     "smtp_host": "",
-    "smtp_port": 587,
+    "smtp_port": 465,
     "smtp_user": "",
     "smtp_password": "",
     "smtp_from_email": "",
     "smtp_from_name": "",  # 空则自动使用 site_name
-    "smtp_use_tls": True,
+    "smtp_use_tls": False,
     # 品牌配置
     "site_logo": "",
     "footer_text": "",
@@ -267,12 +267,12 @@ async def get_email_config_api(
     settings = await get_all_settings(db)
     return {
         "smtp_host": settings.get("smtp_host", ""),
-        "smtp_port": settings.get("smtp_port", 587),
+        "smtp_port": settings.get("smtp_port", 465),
         "smtp_user": settings.get("smtp_user", ""),
         "smtp_password": "******" if settings.get("smtp_password") else "",  # 密码不返回明文
         "smtp_from_email": settings.get("smtp_from_email", ""),
         "smtp_from_name": settings.get("smtp_from_name", ""),
-        "smtp_use_tls": settings.get("smtp_use_tls", True),
+        "smtp_use_tls": settings.get("smtp_use_tls", False),
         "notification_enabled": settings.get("notification_email_enabled", True),
         "verification_required": settings.get("email_verification_required", True),
         "is_configured": bool(settings.get("smtp_host") and settings.get("smtp_user") and settings.get("smtp_password")),
