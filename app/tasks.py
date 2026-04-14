@@ -1101,6 +1101,9 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
     
+    # 队列名称前缀（隔离不同服务的 ARQ 任务）
+    queue_name = 'arq:lmaicloud'
+    
     # Worker 配置
     max_jobs = 10  # 最大并发任务数
     job_timeout = 300  # 任务超时时间（秒）
@@ -1145,7 +1148,7 @@ async def enqueue_task(task_name: str, *args, **kwargs):
         await enqueue_task("send_email_task", "user@example.com", "Welcome", "Hello!")
     """
     pool = await get_arq_pool()
-    job = await pool.enqueue_job(task_name, *args, **kwargs)
+    job = await pool.enqueue_job(task_name, *args, _queue_name='arq:lmaicloud', **kwargs)
     return job
 
 
@@ -1166,6 +1169,7 @@ async def enqueue_task_delayed(task_name: str, delay_seconds: int, *args, **kwar
     job = await pool.enqueue_job(
         task_name,
         *args,
+        _queue_name='arq:lmaicloud',
         _defer_by=timedelta(seconds=delay_seconds),
         **kwargs
     )

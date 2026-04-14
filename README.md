@@ -46,9 +46,21 @@ tests/                   # 单元测试
 
 ## 快速启动
 
-### 方式一：uv + venv（推荐，当前环境使用的是这个）
-
 ```bash
+
+### 方式一：pip + venv
+# 创建虚拟环境
+python3 -m venv .venv
+
+# 激活虚拟环境
+# Linux/macOS
+source .venv/bin/activate
+
+# 安装依赖
+pip install -r requirements.txt
+
+### 方式二：uv + venv（推荐，当前环境使用的是这个）
+
 # 安装 uv（若未安装）
 pip install uv
 
@@ -63,33 +75,10 @@ source .venv/bin/activate
 
 # 安装依赖（比 pip 快 10x）
 uv pip install -r requirements.txt
+
 ```
 
-### 方式二：pip + venv
-
-```bash
-python -m venv .venv
-
-# 激活虚拟环境
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-source .venv/bin/activate
-
-# 安装依赖
-pip install -r requirements.txt
-```
-
-### 2. 配置环境变量
-
-```bash
-cp .env.example .env
-# 编辑 .env 填写数据库、Redis等配置
-
-# 复制 k8s 配置文件 到./.k8s_config 
-```
-
-### 3. 启动数据库
+### 2. 启动数据库
 
 ```bash
 # PostgreSQL
@@ -102,20 +91,26 @@ docker run -d --name postgres \
 docker run -d --name redis -p 6379:6379 redis:7
 ```
 
-### 4. 初始化数据库
+### 3. 配置环境变量
 
 ```bash
-python -m app.database
+cp .env.example .env
+# 编辑 .env 填写数据库、Redis等配置
+
+# 创建data目录
+sudo mkdir /opt/data && sudo chown -R ubuntu:ubuntu /opt/data
+
+# 复制 k8s 配置文件 到./.k8s_config
+sudo cp /root/.kube/config .k8s_config && sudo chmod +r .k8s_config
 ```
 
-### 5. 启动服务
+### 4. 启动服务
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8884
 ```
 
-API文档：http://localhost:8000/docs
+API文档：http://localhost:8884/docs
 http://115.190.25.82:8883/gpucloudapi/docs
 
 ## 运行测试

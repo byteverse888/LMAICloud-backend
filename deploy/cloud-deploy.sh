@@ -432,6 +432,10 @@ install_containerd() {
         apt-get update -qq
         apt-get install -y -qq containerd.io
         
+        # 安装 Docker CE 和 docker-compose (后端服务部署需要)
+        log_info "安装 Docker CE 和 docker-compose..."
+        apt-get install -y -qq docker-ce docker-ce-cli docker-compose-plugin
+        
         NEED_CONFIG=true
     fi
     
