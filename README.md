@@ -107,7 +107,7 @@ sudo cp /root/.kube/config .k8s_config && sudo chmod +r .k8s_config
 ### 4. 启动服务
 
 ```bash
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8884
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API文档：http://localhost:8884/docs

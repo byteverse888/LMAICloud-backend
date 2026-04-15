@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # 配置
-API_URL="${API_URL:-http://115.190.25.82:8883/parseapi/config}"
+API_URL="${API_URL:-http://127.0.0.1:1337/parse/config}"
 APP_ID="${APP_ID:-BTGAPPId}"
 MASTER_KEY="${MASTER_KEY:-BTGMASTERKEY123}"
-CLUSTERS="${CLUSTERS:-beijing:115.190.25.82}"
+CLUSTERS="${CLUSTERS:-beijing:115.190.180.194}"
 
 # 检查命令
 command -v keadm >/dev/null 2>&1 || { echo "Error: keadm not found"; exit 1; }
