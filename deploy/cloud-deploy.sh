@@ -547,6 +547,9 @@ TOML
             cat > /etc/containerd/certs.d/registry.k8s.io/hosts.toml << 'TOML'
 server = "https://registry.k8s.io"
 
+[host."https://k8s.m.daocloud.io"]
+  capabilities = ["pull", "resolve"]
+
 [host."https://registry.aliyuncs.com/google_containers"]
   capabilities = ["pull", "resolve"]
 TOML
@@ -628,6 +631,9 @@ _configure_containerd() {
             mkdir -p /etc/containerd/certs.d/registry.k8s.io
             cat > /etc/containerd/certs.d/registry.k8s.io/hosts.toml << 'TOML'
 server = "https://registry.k8s.io"
+
+[host."https://k8s.m.daocloud.io"]
+  capabilities = ["pull", "resolve"]
 
 [host."https://registry.aliyuncs.com/google_containers"]
   capabilities = ["pull", "resolve"]
