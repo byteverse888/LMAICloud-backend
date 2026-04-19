@@ -47,6 +47,7 @@ def _calc_mem_percent(node_name: str, memory_gb: int, metrics_map: dict) -> floa
 async def list_nodes(
     status: Optional[str] = None,
     node_type: Optional[str] = None,
+    gpu_model: Optional[str] = None,
     current_user = Depends(get_current_admin_user),
 ):
     """获取节点列表 - 从K8s实时获取"""
@@ -92,9 +93,16 @@ async def list_nodes(
         if node_type and node_type_value != node_type:
             continue
         
-        # 解析GPU型号
+        # 解析GPU型号和显存
         labels = node.get('labels', {})
-        gpu_model = labels.get('nvidia.com/gpu.product', 'Unknown GPU')
+        node_gpu_model = labels.get('nvidia.com/gpu.product', 'N/A')
+        # nvidia.com/gpu.memory 单位为 MiB，转换为 GB（向上取整）
+        gpu_memory_mib = int(labels.get('nvidia.com/gpu.memory', '0') or '0')
+        gpu_memory_gb = round(gpu_memory_mib / 1024) if gpu_memory_mib > 0 else 0
+
+        # GPU 型号过滤
+        if gpu_model and node_gpu_model != gpu_model:
+            continue
         
         # 解析CPU和内存
         cpu_capacity = node.get('cpu_capacity', '0')
@@ -122,7 +130,8 @@ async def list_nodes(
             "cluster": settings.k8s_cluster_name,
             "status": node_status,
             "node_type": node_type_value,
-            "gpu_model": gpu_model,
+            "gpu_model": node_gpu_model,
+            "gpu_memory": gpu_memory_gb,
             "gpu_count": node.get('gpu_count', 0),
             "gpu_available": node.get('gpu_allocatable', 0),
             "cpu_cores": cpu_cores,

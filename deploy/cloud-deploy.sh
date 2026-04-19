@@ -843,6 +843,23 @@ install_network_plugin() {
         sed -i "s|#   value: \"192.168.0.0/16\"|  value: \"$POD_CIDR\"|" calico.yaml
     fi
     
+    # 排除 KubeEdge 边缘节点：给 calico-node DaemonSet 添加 nodeAffinity
+    if ! grep -q 'node-role.kubernetes.io/edge' calico.yaml; then
+        log_info "配置 Calico 排除边缘节点..."
+        sed -i '/serviceAccountName: calico-node/i\
+      # 禁止在 KubeEdge 边缘节点运行\
+      affinity:\
+        nodeAffinity:\
+          requiredDuringSchedulingIgnoredDuringExecution:\
+            nodeSelectorTerms:\
+            - matchExpressions:\
+              - key: node-role.kubernetes.io/edge\
+                operator: DoesNotExist' calico.yaml
+        log_info "Calico 边缘节点排除配置完成"
+    else
+        log_info "Calico 已包含边缘节点排除配置，跳过"
+    fi
+    
     # 预拉取 Calico 镜像 (国内环境 docker.io 不稳定，从华为云镜像拉取后重命名)
     if [[ "$USE_CN_MIRROR" == "true" ]]; then
         log_info "从国内镜像预拉取 Calico 镜像..."
@@ -881,6 +898,27 @@ install_network_plugin() {
     done
     
     log_info "Calico 安装完成"
+
+    # kubectl -n kube-system patch daemonset calico-node --type=merge -p '{
+    #   "spec": {
+    #     "template": {
+    #       "spec": {
+    #         "affinity": {
+    #           "nodeAffinity": {
+    #             "requiredDuringSchedulingIgnoredDuringExecution": {
+    #               "nodeSelectorTerms": [{
+    #                 "matchExpressions": [{
+    #                   "key": "node-role.kubernetes.io/edge",
+    #                   "operator": "DoesNotExist"
+    #                 }]
+    #               }]
+    #             }
+    #           }
+    #         }
+    #       }
+    #     }
+    #   }
+    # }'
 }
 
 #===============================================================================

@@ -156,6 +156,9 @@ async def list_resource_configs(
         cpu_cores = _parse_cpu(kn.get("cpu_capacity", "0"))
         mem_gb = _parse_memory_gb(kn.get("memory_capacity", "0"))
         kn_gpu_model = labels.get("nvidia.com/gpu.product", "N/A")
+        # nvidia.com/gpu.memory 单位为 MiB，转换为 GB
+        gpu_memory_mib = int(labels.get("nvidia.com/gpu.memory", "0") or "0")
+        kn_gpu_memory = round(gpu_memory_mib / 1024) if gpu_memory_mib > 0 else 0
         kn_gpu_count = kn.get("gpu_count", 0)
         kn_gpu_alloc = kn.get("gpu_allocatable", 0)
 
@@ -171,7 +174,7 @@ async def list_resource_configs(
                 node_type=kn_type,
                 resource_type="vGPU",
                 gpu_model=kn_gpu_model,
-                gpu_memory=0,
+                gpu_memory=kn_gpu_memory,
                 cpu_model=f"{cpu_cores}核 {mem_gb}G",
                 cpu_cores=cpu_cores,
                 memory=mem_gb,
@@ -192,7 +195,7 @@ async def list_resource_configs(
                 node_type=kn_type,
                 resource_type="no_gpu",
                 gpu_model=kn_gpu_model,
-                gpu_memory=0,
+                gpu_memory=0,  # 无卡模式不需要显存
                 cpu_model=f"{max(1, cpu_cores // 4)}核 {max(1, mem_gb // 4)}G",
                 cpu_cores=max(1, cpu_cores // 4),
                 memory=max(1, mem_gb // 4),

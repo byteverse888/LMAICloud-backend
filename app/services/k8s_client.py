@@ -235,13 +235,19 @@ class K8sClient:
         capacity = status.capacity or {}
         allocatable = status.allocatable or {}
         
-        # GPU 信息
+        # GPU 信息：优先从 capacity 读取，边缘节点可能没有 Device Plugin，回退读标签
+        labels = node.metadata.labels or {}
         gpu_count = int(capacity.get("nvidia.com/gpu", 0))
         gpu_allocatable = int(allocatable.get("nvidia.com/gpu", 0))
+        # 边缘节点 fallback：从 nvidia.com/gpu.count 标签读取
+        if gpu_count == 0:
+            gpu_count = int(labels.get("nvidia.com/gpu.count", 0) or 0)
+        if gpu_allocatable == 0 and gpu_count > 0:
+            gpu_allocatable = gpu_count
         
         return {
             "name": node.metadata.name,
-            "labels": node.metadata.labels or {},
+            "labels": labels,
             "status": "Ready" if conditions.get("Ready") == "True" else "NotReady",
             "unschedulable": node.spec.unschedulable or False,
             "cpu_capacity": capacity.get("cpu"),
